@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Env
+.env
+
+# Data (raw dataset + generated warehouse are not committed)
+data/raw/olist/*
+!data/raw/olist/.gitkeep
+data/warehouse.duckdb
+
+# OS
+.DS_Store
