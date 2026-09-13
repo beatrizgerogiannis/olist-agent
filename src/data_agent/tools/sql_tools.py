@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import duckdb
+import structlog
 from pydantic import BaseModel
 
 from data_agent.db import get_connection
 from data_agent.schemas import ToolQueryResult
 from data_agent.tools.guardrails import DEFAULT_QUERY_TIMEOUT_SECONDS, TABLE_ORDER, execute_guarded
+
+logger = structlog.get_logger(__name__)
 
 # Descrições curadas a partir de docs/data_dictionary.md — mantenha em sincronia
 # se o dicionário de dados mudar. As colunas e tipos vêm direto do DuckDB, para
@@ -64,8 +68,10 @@ class TableInfo(BaseModel):
 
 def get_schema(*, db_path: str | Path | None = None) -> list[TableInfo]:
     """Descreve as tabelas/colunas disponíveis para consulta via ``query_sales``."""
-    con = get_connection(db_path)
+    logger.info("get_schema_started")
+    con: duckdb.DuckDBPyConnection | None = None
     try:
+        con = get_connection(db_path)
         tables: list[TableInfo] = []
         for table_name in TABLE_ORDER:
             rows = con.execute(
@@ -81,9 +87,15 @@ def get_schema(*, db_path: str | Path | None = None) -> list[TableInfo]:
                     columns=columns,
                 )
             )
+    except Exception:
+        logger.exception("get_schema_failed")
+        raise
+    else:
+        logger.info("get_schema_completed", table_count=len(tables))
         return tables
     finally:
-        con.close()
+        if con is not None:
+            con.close()
 
 
 def query_sales(
@@ -93,12 +105,20 @@ def query_sales(
     timeout_seconds: float = DEFAULT_QUERY_TIMEOUT_SECONDS,
 ) -> ToolQueryResult:
     """Executa ``sql`` (somente leitura, validada por tools/guardrails.py) no warehouse."""
-    con = get_connection(db_path)
+    logger.info("query_sales_started", sql=sql)
+    con: duckdb.DuckDBPyConnection | None = None
     try:
+        con = get_connection(db_path)
         safe_sql = execute_guarded(con, sql, timeout_seconds=timeout_seconds)
         assert con.description is not None
         columns = [description[0] for description in con.description]
         rows = [dict(zip(columns, row, strict=True)) for row in con.fetchall()]
+    except Exception:
+        logger.exception("query_sales_failed", sql=sql)
+        raise
+    else:
+        logger.info("query_sales_completed", sql=safe_sql, row_count=len(rows))
         return ToolQueryResult(sql=safe_sql, columns=columns, rows=rows, row_count=len(rows))
     finally:
-        con.close()
+        if con is not None:
+            con.close()

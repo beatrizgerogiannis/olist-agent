@@ -232,6 +232,24 @@ def test_get_schema_describes_all_olist_tables(db_path: Path) -> None:
     }
 
 
+def test_get_schema_logs_and_reraises_on_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # structlog (sem integração com o `logging` stdlib) imprime direto no
+    # stdout por padrão — não passa por `caplog`. `capsys` é o jeito correto de
+    # observar essas linhas num teste (ver AGENTS.md: confirmar comportamento
+    # por teste, não só por leitura do código). Não fixamos o formato exato
+    # (console ou JSON depende de qual processor está configurado no momento
+    # em que o teste roda — ver `data_agent.api._configure_structlog`), só que
+    # o evento de falha foi de fato emitido.
+    missing_db_path = tmp_path / "does-not-exist.duckdb"
+
+    with pytest.raises(FileNotFoundError):
+        get_schema(db_path=missing_db_path)
+
+    assert "get_schema_failed" in capsys.readouterr().out
+
+
 @pytest.fixture
 def slow_query_db_path(tmp_path: Path) -> Path:
     """DuckDB com uma `order_items` grande o bastante para um cross join lento.

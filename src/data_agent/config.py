@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     duckdb_path: Path = Path("data/warehouse.duckdb")
+    openai_api_key: str = ""
+    openai_timeout_seconds: float = 30.0
+    log_level: str = "INFO"
 
 
 @lru_cache
