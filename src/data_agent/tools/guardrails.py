@@ -56,9 +56,16 @@ _ALLOWED_STATEMENT_TYPES: tuple[type[exp.Expression], ...] = (
 
 # Nomes de nó "folha" (sem filhos) no plano do DuckDB que não leem de uma
 # tabela real e por isso não precisam passar pela allowlist: ``DUMMY_SCAN``
-# (ex.: ``SELECT 1``), ``EMPTY_RESULT``, e re-leituras de uma CTE já
-# materializada/decorrelacionada (o SEQ_SCAN real por trás dela é validado
-# separadamente, como outro nó do mesmo plano).
+# (ex.: ``SELECT 1``) e re-leituras de uma CTE já materializada/decorrelacionada
+# (``CTE_SCAN`` — o ``SEQ_SCAN`` real por trás dela é validado separadamente,
+# como outro nó do mesmo plano). Confirmado que ambos aparecem no plano
+# **lógico** (que ``_check_allowed_tables`` lê — ver sua docstring) para
+# ``SELECT 1`` e para CTEs comuns/recursivas, respectivamente.
+# ``EMPTY_RESULT``, ``REC_CTE_SCAN`` e ``DELIM_SCAN`` são otimizações do
+# planejador **físico** (não observadas no plano lógico em nenhum dos
+# formatos de query testados nesta investigação — ver docstring de
+# ``_check_allowed_tables``); mantidos aqui só como rede de segurança caso
+# algum formato de query não testado ainda os produza no plano lógico.
 _NO_SOURCE_LEAF_NODES: frozenset[str] = frozenset(
     {"DUMMY_SCAN", "EMPTY_RESULT", "CTE_SCAN", "REC_CTE_SCAN", "DELIM_SCAN"}
 )
@@ -81,20 +88,56 @@ def _check_allowed_tables(con: duckdb.DuckDBPyConnection, statement: str) -> Non
     ``duckdb_tables()``, ``read_csv(...)``) não batem com um regex de
     identificador simples e passariam pela allowlist sem serem detectados —
     confirmado executando esse bypass contra o warehouse real antes desta
-    correção. Em vez disso, pedimos ao próprio DuckDB o plano de execução
-    (``EXPLAIN (FORMAT JSON)``), que já resolve aspas, aliases e CTEs para os
-    nomes de tabela reais, e validamos cada nó-folha do plano: um ``SEQ_SCAN``
-    precisa apontar para uma tabela permitida, e qualquer outro tipo de fonte
-    de dados (função de tabela, leitura de arquivo, catálogo do sistema) é
-    bloqueada por padrão — allowlist, não blocklist.
+    correção. Em vez disso, pedimos ao próprio DuckDB o plano de execução, que
+    já resolve aspas, aliases e CTEs para os nomes de tabela reais, e
+    validamos cada nó-folha do plano: um ``SEQ_SCAN`` precisa apontar para uma
+    tabela permitida, e qualquer outro tipo de fonte de dados (função de
+    tabela, leitura de arquivo, catálogo do sistema) é bloqueada por padrão —
+    allowlist, não blocklist.
+
+    Lê especificamente o **plano lógico, pré-otimização** (``PRAGMA
+    explain_output='all'`` + a chave ``"logical_plan"`` do resultado de
+    ``EXPLAIN (FORMAT JSON)``), não o plano físico (o que ``EXPLAIN`` devolve
+    por padrão). O otimizador físico do DuckDB reescreve alguns padrões de
+    leitura de tabela para operadores que não carregam mais o nome da tabela
+    em ``extra_info`` — descoberto como achado colateral da validação manual
+    do Dia 5 (observabilidade), reproduzido contra o warehouse real:
+    ``query_sales("SELECT COUNT(*) AS c FROM sellers")`` (uma tabela
+    normalmente permitida) era bloqueada com ``SqlGuardrailError: Fonte de
+    dados não permitida em SQL somente-leitura: ['COLUMN_DATA_SCAN']`` — um
+    falso positivo, porque ``COUNT(*)``/``COUNT(coluna)`` sem filtro sobre uma
+    tabela inteira vira um nó físico ``COLUMN_DATA_SCAN`` (lê só metadados de
+    zonemap, não a coluna de verdade) sem nenhum ``Table`` em ``extra_info``,
+    então caía no branch de "fonte de dados não reconhecida" em vez de ser
+    validado contra ``ALLOWED_TABLES`` como um ``SEQ_SCAN`` normal. Investigar
+    isso também expôs um segundo problema, mais sério, na mesma família:
+    ``SELECT * FROM outra_tabela WHERE 1=0`` (uma tabela fora da allowlist)
+    **não era bloqueada** — o otimizador físico já sabe que o predicado é
+    sempre falso e substitui a leitura inteira por um ``EMPTY_RESULT``
+    constante, também sem nome de tabela, e ``EMPTY_RESULT`` já estava (e
+    continua) na lista de nós "sem fonte" abaixo (``_NO_SOURCE_LEAF_NODES``),
+    pensada para casos como ``SELECT 1`` (que legitimamente não lê tabela
+    nenhuma). Comparando ``physical_plan`` com ``logical_plan`` lado a lado
+    para mais de 15 formatos de query (``COUNT(*)``/``COUNT(coluna)`` com e
+    sem ``WHERE``/``GROUP BY``/``JOIN``/CTE/``UNION``/window function/
+    subquery correlacionada/CTE recursiva/predicado sempre-falso) contra um
+    warehouse real: o plano lógico (capturado antes dessas duas otimizações)
+    preserva o ``SEQ_SCAN`` com a tabela real em todos os casos — inclusive
+    nos dois falsos positivos/negativos acima — e continua idêntico ao plano
+    físico em todos os outros formatos de query já cobertos pelos testes
+    existentes (``SELECT *``, ``information_schema``, ``duckdb_tables()``,
+    CTE comum, agregação com ``WHERE``/``GROUP BY``). Ver
+    ``tests/test_tools.py`` para os casos de regressão de ambos os problemas,
+    e docs/adrs/0002-camada-de-dados.md para a nota registrando esta correção.
     """
     try:
-        plan_json = con.execute(f"EXPLAIN (FORMAT JSON) {statement}").fetchone()
+        con.execute("PRAGMA explain_output='all'")
+        rows = con.execute(f"EXPLAIN (FORMAT JSON) {statement}").fetchall()
     except duckdb.Error as exc:
         raise SqlGuardrailError(f"Query inválida: {exc}") from exc
 
-    assert plan_json is not None
-    plan: list[dict[str, Any]] = json.loads(plan_json[1])
+    plan_by_name = dict(rows)
+    plan: list[dict[str, Any]] = json.loads(plan_by_name["logical_plan"])
 
     disallowed_tables: set[str] = set()
     disallowed_sources: set[str] = set()

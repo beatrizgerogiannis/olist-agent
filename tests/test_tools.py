@@ -171,6 +171,105 @@ def test_query_sales_blocks_real_table_outside_allowlist(db_path: Path, sql: str
         query_sales(sql, db_path=db_path)
 
 
+def test_query_sales_count_star_on_allowed_table_is_accepted(db_path: Path) -> None:
+    """Regressão: falso positivo encontrado como achado colateral da validação
+    manual do Dia 5 (observabilidade). ``COUNT(*)``/``COUNT(coluna)`` sem
+    filtro sobre uma tabela inteira é reescrito pelo otimizador **físico** do
+    DuckDB para um nó ``COLUMN_DATA_SCAN`` (lê só metadados de zonemap, não a
+    coluna de verdade), que não carrega o nome da tabela em ``extra_info`` —
+    sem a correção em ``_check_allowed_tables`` (ler o plano **lógico**,
+    pré-otimização, em vez do físico — ver a docstring dessa função para os
+    detalhes da investigação), isso era bloqueado como falso positivo:
+
+        >>> from data_agent.tools.sql_tools import query_sales
+        >>> query_sales("SELECT COUNT(*) AS c FROM sellers")
+        SqlGuardrailError: Fonte de dados não permitida em SQL somente-leitura:
+        ['COLUMN_DATA_SCAN'].
+
+    reproduzido de verdade contra ``data/warehouse.duckdb`` (``sellers`` tem
+    3095 linhas lá) antes desta correção, não só inferido lendo o código.
+    """
+    result = query_sales("SELECT COUNT(*) AS seller_count FROM sellers", db_path=db_path)
+
+    assert result.rows == [{"seller_count": 1}]
+
+
+@pytest.mark.parametrize(
+    "sql,expected_rows",
+    [
+        ("SELECT COUNT(seller_id) AS c FROM sellers", [{"c": 1}]),
+        (
+            "SELECT seller_state, COUNT(*) AS c FROM sellers GROUP BY seller_state",
+            [{"seller_state": "SP", "c": 1}],
+        ),
+        ("SELECT COUNT(*) AS c FROM sellers WHERE seller_state = 'SP'", [{"c": 1}]),
+        (
+            "SELECT COUNT(*) AS c FROM order_items oi JOIN orders o ON oi.order_id = o.order_id",
+            [{"c": ORDER_ITEMS_ROW_COUNT}],
+        ),
+        ("SELECT SUM(price) AS s FROM order_items", [{"s": 78.90}]),
+        ("SELECT AVG(price) AS a FROM order_items", [{"a": 39.45}]),
+    ],
+)
+def test_query_sales_count_star_variants_are_accepted(
+    db_path: Path, sql: str, expected_rows: list[dict[str, object]]
+) -> None:
+    """Regressão complementar ao teste acima: ``COUNT(*)``/``COUNT(coluna)``
+    combinado com ``GROUP BY``/``WHERE``/``JOIN`` entre tabelas da allowlist,
+    e outras agregações comuns (``SUM``/``AVG`` de uma coluna específica), não
+    devem regredir com a correção. Nenhuma dessas variações passava pelo
+    ``COLUMN_DATA_SCAN`` mesmo antes da correção (o otimizador só usa esse
+    atalho para ``COUNT(*)``/``COUNT(coluna)`` sem filtro sobre uma tabela
+    inteira — confirmado comparando o plano de cada uma delas durante a
+    investigação, ver docstring de ``_check_allowed_tables``), mas a correção
+    trocou o mecanismo de validação inteiro (plano lógico em vez de físico),
+    então vale confirmar que esses formatos continuam resolvendo para o
+    ``SEQ_SCAN`` esperado e não passam a ser bloqueados por engano.
+    """
+    result = query_sales(sql, db_path=db_path)
+
+    assert result.rows == expected_rows
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT COUNT(*) AS c FROM outra_tabela",
+        "SELECT COUNT(id) AS c FROM outra_tabela",
+        # Um predicado sempre-falso faz o otimizador físico do DuckDB
+        # substituir a leitura inteira por um `EMPTY_RESULT` constante, sem
+        # nome de tabela nenhum — um segundo bug (bypass real da allowlist,
+        # mais sério que o falso positivo do COUNT(*) acima) encontrado
+        # durante a mesma investigação: antes desta correção, `outra_tabela`
+        # (fora da allowlist) NÃO era bloqueada quando a query tinha esse
+        # filtro, porque `EMPTY_RESULT` já estava isento da validação
+        # (pensado para casos legítimos como `SELECT 1`, que não lê tabela
+        # nenhuma) — reproduzido contra um warehouse real antes desta
+        # correção (ver docstring de `_check_allowed_tables`).
+        "SELECT * FROM outra_tabela WHERE 1 = 0",
+    ],
+)
+def test_query_sales_blocks_real_table_outside_allowlist_via_optimizer_rewrites(
+    db_path: Path, sql: str
+) -> None:
+    """Garante que a correção do falso positivo de ``COUNT(*)`` (ler o plano
+    lógico em vez do físico) não abriu uma brecha de segurança: uma tabela que
+    existe de fato no warehouse, mas fora da allowlist do Olist, continua
+    bloqueada mesmo nos dois formatos de query que o otimizador físico do
+    DuckDB reescreve para um nó sem nome de tabela (``COLUMN_DATA_SCAN``/
+    ``EMPTY_RESULT``) — os mesmos dois formatos que motivaram a correção.
+    """
+    con = duckdb.connect(str(db_path))
+    try:
+        con.execute("CREATE TABLE outra_tabela (id INTEGER)")
+        con.execute("INSERT INTO outra_tabela VALUES (1)")
+    finally:
+        con.close()
+
+    with pytest.raises(SqlGuardrailError, match="Tabela\\(s\\) fora da allowlist"):
+        query_sales(sql, db_path=db_path)
+
+
 @pytest.mark.parametrize(
     "sql",
     [

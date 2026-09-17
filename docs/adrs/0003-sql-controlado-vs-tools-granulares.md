@@ -101,3 +101,27 @@ entregue, dado o número de dimensões combináveis do escopo.
   não seja somente-leitura (ver `tests/test_tools.py`). É o mesmo padrão já usado em
   `_check_allowed_tables`: confiar na estrutura real (parser/plano), não em uma aproximação
   textual, tanto para não deixar passar algo perigoso quanto para não bloquear algo legítimo.
+- Uma terceira rodada no mesmo padrão: `_check_allowed_tables` validava o plano **físico** (o
+  que `EXPLAIN (FORMAT JSON)` devolve por padrão) do DuckDB, mas o otimizador físico reescreve
+  alguns padrões de leitura de tabela para operadores que não carregam mais o nome da tabela —
+  achado colateral da validação manual do Dia 5 (observabilidade,
+  [ADR-0007](0007-observabilidade-com-langfuse.md)): `query_sales("SELECT COUNT(*) AS c FROM
+  sellers")`, uma tabela normalmente permitida, era bloqueada como falso positivo
+  (`SqlGuardrailError: Fonte de dados não permitida ... ['COLUMN_DATA_SCAN']`), porque
+  `COUNT(*)`/`COUNT(coluna)` sem filtro sobre uma tabela inteira vira um nó físico
+  `COLUMN_DATA_SCAN` (lê só metadados de zonemap) sem `Table` em `extra_info`. Investigar isso
+  expôs um segundo bug, mais sério — um bypass real, não um falso positivo: `SELECT * FROM
+  <tabela fora da allowlist> WHERE 1=0` não era bloqueado, porque um predicado sempre-falso
+  vira um `EMPTY_RESULT` constante (sem tabela nenhuma), e `EMPTY_RESULT` já era ignorado por
+  design (pensado para `SELECT 1`). Ambos reproduzidos contra um warehouse real antes da
+  correção. A correção troca a fonte de verdade de `_check_allowed_tables` do plano físico para
+  o plano **lógico** (pré-otimização, obtido com `PRAGMA explain_output='all'`): confirmado
+  comparando os dois planos lado a lado para mais de 15 formatos de query que o plano lógico
+  preserva o `SEQ_SCAN` com a tabela real nos dois casos acima, e continua idêntico ao plano
+  físico em todo formato de query já coberto por teste (ver a docstring de
+  `_check_allowed_tables` para o comparativo completo, e
+  `tests/test_tools.py::test_query_sales_count_star_on_allowed_table_is_accepted`,
+  `test_query_sales_count_star_variants_are_accepted` e
+  `test_query_sales_blocks_real_table_outside_allowlist_via_optimizer_rewrites` para as
+  regressões — a última confirma que a correção do falso positivo não abriu a brecha do
+  `EMPTY_RESULT`, cobrindo os dois bugs com o mesmo teste que motivou a mudança).

@@ -6,7 +6,7 @@ from typing import Any, AsyncIterator, Iterator
 import pytest
 from agno.agent import Agent
 from agno.models.base import Model
-from agno.models.openai import OpenAIChat
+from agno.models.groq import Groq
 from agno.models.response import ModelResponse
 
 from data_agent.agent import build_agent
@@ -17,12 +17,12 @@ from data_agent.tools.sql_tools import get_schema, query_sales
 
 
 @pytest.fixture(autouse=True)
-def _mock_openai_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    # `Settings.openai_api_key` tem default "" (vazio); sem fixar um valor aqui,
-    # `test_build_agent_uses_openai_chat_model_with_settings_api_key` ficaria
+def _mock_groq_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `Settings.groq_api_key` tem default "" (vazio); sem fixar um valor aqui,
+    # `test_build_agent_uses_groq_model_with_settings_api_key` ficaria
     # acoplado ao que estiver (ou não) num `.env` real na máquina de quem roda os
     # testes, em vez de testar o wiring settings -> agent.model.api_key isolado.
-    monkeypatch.setenv("OPENAI_API_KEY", "test_key")
+    monkeypatch.setenv("GROQ_API_KEY", "test_key")
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
@@ -50,11 +50,38 @@ def test_build_agent_uses_the_versioned_system_prompt() -> None:
     assert agent.instructions == SYSTEM_PROMPT
 
 
-def test_build_agent_uses_openai_chat_model_with_settings_api_key() -> None:
+def test_build_agent_uses_groq_model_with_settings_api_key() -> None:
     agent = build_agent()
 
-    assert isinstance(agent.model, OpenAIChat)
+    assert isinstance(agent.model, Groq)
     assert agent.model.api_key == "test_key"
+
+
+def test_build_agent_main_model_does_not_advertise_structured_outputs() -> None:
+    # Defaults herdados de `agno.models.base.Model`, não sobrescritos por
+    # `agno.models.groq.Groq` — mantidos `False` no modelo principal de propósito
+    # (ver docstring de `build_agent`): é o `parser_model` (abaixo) que assume a
+    # estruturação, porque a API da Groq rejeita `response_format` combinado com
+    # `tools` na mesma chamada.
+    agent = build_agent()
+
+    assert agent.model.supports_native_structured_outputs is False
+    assert agent.model.supports_json_schema_outputs is False
+
+
+def test_build_agent_uses_a_tool_less_parser_model_for_structured_output() -> None:
+    # `docs/adrs/0006-troca-de-provedor-llm-para-groq.md`: sem `parser_model`,
+    # `agent.run()` falha com 400 da API da Groq em toda chamada real, porque o
+    # modelo principal sempre tem tools. O `parser_model` roda uma chamada extra,
+    # sem tools, só para estruturar a resposta final em `AgentAnswer` — por isso
+    # precisa de `supports_json_schema_outputs=True` (o modelo principal
+    # deliberadamente não tem isso, ver teste acima).
+    agent = build_agent()
+
+    assert isinstance(agent.parser_model, Groq)
+    assert agent.parser_model is not agent.model
+    assert agent.parser_model.api_key == "test_key"
+    assert agent.parser_model.supports_json_schema_outputs is True
 
 
 @dataclass

@@ -48,7 +48,7 @@ jobs:
       - name: Write mocked test .env
         run: |
           cat <<'EOF' > .env
-          OPENAI_API_KEY=test_key
+          GROQ_API_KEY=test_key
           LANGFUSE_PUBLIC_KEY=test_public_key
           LANGFUSE_SECRET_KEY=test_secret_key
           LANGFUSE_HOST=http://localhost:3000

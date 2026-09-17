@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 from typing import Any
 
+import groq
 import httpx
-import openai
 import pytest
 from agno.agent import Agent
 from agno.exceptions import ModelProviderError
@@ -24,7 +24,7 @@ class _FakeRunOutput:
 class _FakeAgent:
     """Substituto de ``agno.agent.Agent`` injetado via ``api.get_agent``.
 
-    Isola os testes de ``POST /ask`` de qualquer chamada real ao Agno/OpenAI:
+    Isola os testes de ``POST /ask`` de qualquer chamada real ao Agno/Groq:
     cada teste controla exatamente o que ``agent.run()`` devolve ou levanta.
     """
 
@@ -48,7 +48,7 @@ def _use_fake_agent(monkeypatch: pytest.MonkeyPatch, agent: _FakeAgent) -> None:
 
 
 def test_get_agent_builds_and_caches_a_real_agno_agent(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OPENAI_API_KEY", "test_key")
+    monkeypatch.setenv("GROQ_API_KEY", "test_key")
     get_settings.cache_clear()
     api.get_agent.cache_clear()
     try:
@@ -152,9 +152,9 @@ def test_ask_malformed_input_returns_422(
 
 
 def test_ask_model_timeout_returns_504(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    timeout_error = openai.APITimeoutError(request=httpx.Request("POST", "http://x"))
+    timeout_error = groq.APITimeoutError(request=httpx.Request("POST", "http://x"))
     model_error = ModelProviderError(
-        message=str(timeout_error), model_name="OpenAIChat", model_id="gpt-x"
+        message=str(timeout_error), model_name="Groq", model_id="openai/gpt-oss-120b"
     )
     model_error.__cause__ = timeout_error
     _use_fake_agent(monkeypatch, _FakeAgent(exception=model_error))
@@ -168,7 +168,7 @@ def test_ask_model_provider_error_without_timeout_returns_502(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     model_error = ModelProviderError(
-        message="rate limited", status_code=429, model_name="OpenAIChat", model_id="gpt-x"
+        message="rate limited", status_code=429, model_name="Groq", model_id="openai/gpt-oss-120b"
     )
     _use_fake_agent(monkeypatch, _FakeAgent(exception=model_error))
 

@@ -10,7 +10,7 @@ import logging
 from functools import lru_cache
 from typing import Literal
 
-import openai
+import groq
 import structlog
 from agno.agent import Agent
 from agno.exceptions import ModelProviderError
@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from data_agent.agent import build_agent
 from data_agent.config import get_settings
+from data_agent.observability import configure_observability
 from data_agent.schemas import AgentAnswer, AskRequest
 
 _LOG_LEVELS = logging.getLevelNamesMapping()
@@ -30,7 +31,8 @@ def _configure_structlog(log_level: str) -> None:
     Chamado na importação deste módulo, antes de qualquer request: assim, todo
     ``structlog.get_logger`` já usado nas tools (``tools/sql_tools.py``) e neste
     módulo sai no mesmo formato JSON, o que facilita cruzar essas linhas com os
-    traces do Langfuse no Dia 5.
+    traces do Langfuse (ver ``configure_observability`` logo abaixo e
+    docs/adrs/0007-observabilidade-com-langfuse.md).
     """
     structlog.configure(
         wrapper_class=structlog.make_filtering_bound_logger(
@@ -48,6 +50,7 @@ def _configure_structlog(log_level: str) -> None:
 
 
 _configure_structlog(get_settings().log_level)
+configure_observability()
 
 logger = structlog.get_logger(__name__)
 
@@ -94,7 +97,7 @@ def ask(request: AskRequest) -> AgentAnswer:
     try:
         run_output = agent.run(request.question)
     except ModelProviderError as exc:
-        is_timeout = isinstance(exc.__cause__, openai.APITimeoutError)
+        is_timeout = isinstance(exc.__cause__, groq.APITimeoutError)
         logger.error(
             "agent_call_model_error",
             question=request.question,

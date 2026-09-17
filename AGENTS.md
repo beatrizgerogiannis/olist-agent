@@ -77,8 +77,12 @@ se já é consumida por algum código do repositório.
 
 | Variável | Propósito |
 |----------|-----------|
-| `OPENAI_API_KEY` | Chave do provedor de LLM usado pelo Agno. |
-| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_HOST` | Observabilidade via Langfuse. |
+| `GROQ_API_KEY` | Chave do provedor de LLM (Groq) usado pelo Agno — ver [ADR-0006](docs/adrs/0006-troca-de-provedor-llm-para-groq.md). |
+| `GROQ_TIMEOUT_SECONDS` | Timeout (segundos) da chamada ao modelo de linguagem. |
+| `LOG_LEVEL` | Nível de log do structlog (`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`). |
+| `LANGFUSE_PUBLIC_KEY` | Public key do projeto Langfuse. |
+| `LANGFUSE_SECRET_KEY` | Secret key do projeto Langfuse. |
+| `LANGFUSE_HOST` | Host do Langfuse que recebe os traces via OTLP — ver [ADR-0007](docs/adrs/0007-observabilidade-com-langfuse.md). |
 | `DUCKDB_PATH` | Caminho do arquivo DuckDB do warehouse local. |
 
 ## Checklist: antes de alterar / durante / depois de alterar
