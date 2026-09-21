@@ -158,12 +158,15 @@ Railway/Fly.io/Hugging Face Spaces, e o raciocínio dos guard-rails abaixo).
    API (`/ask`). Se o boot falhar, o log mostra exatamente por quê (variável ausente ou erro do
    S3 — ver `data_agent/warehouse_fetch.py`); o container não chega a responder `/health`, então
    não existe um estado "no ar mas quebrado" nesse cenário.
-6. **Antes de divulgar o link publicamente, configure um teto de gasto ("spend limit"/"usage
-   limit") na chave do provedor de LLM (Groq) no painel da própria Groq.** O rate limiting por
-   IP em `POST /ask` (`5/minute`, ver [ADR-0010](docs/adrs/0010-hospedagem-do-demo-publico.md))
-   reduz o volume de chamadas por visitante, mas não é um substituto para um teto de gasto real
-   na origem do custo — é a última coisa a fazer antes de compartilhar o link com qualquer
-   pessoa.
+6. **Sobre proteção de custo: este projeto usa o tier gratuito da Groq deliberadamente.**
+   "Spend Limits" (teto de gasto real) exige tier pago da Groq e não está disponível aqui — o
+   tier gratuito não gera cobrança monetária, só nega a requisição quando a cota de uso
+   (RPM/TPM/TPD) é excedida, funcionando como proteção de custo por construção. O rate
+   limiting por IP em `POST /ask` (`5/minute`, ver
+   [ADR-0010](docs/adrs/0010-hospedagem-do-demo-publico.md), seção "Atualização 3") é a segunda
+   camada real, reduzindo o quanto um único visitante/bot esgota essa cota compartilhada — mas
+   não impede abuso distribuído. Se este projeto migrar para tier pago no futuro, configurar um
+   "Spend Limit" real volta a ser um pré-requisito antes de divulgar o link de novo.
 
 O plano free do Render "dorme" o serviço após um período de inatividade — a UI já avisa
 visivelmente que a primeira resposta pode levar até 1 minuto (cold start) enquanto o container

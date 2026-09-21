@@ -117,6 +117,35 @@ Trade-offs explícitos dessa segunda troca:
   `GetObject`. `boto3`/`botocore` (~30MB juntos) ficam no meio: assinatura SigV4 testada e
   mantida pela AWS, não código deste projeto, e uma fração do tamanho do `aws-cli` completo.
 
+### Atualização 3 (mesmo dia): "Spend Limits" da Groq indisponível no tier gratuito
+
+O passo "configurar um teto de gasto na chave do provedor de LLM antes de divulgar o link"
+(cronograma original do Dia 8, e a versão anterior da Decisão/item 5 abaixo) foi verificado
+contra a documentação oficial da Groq
+([console.groq.com/docs/spend-limits](https://console.groq.com/docs/spend-limits)) antes de
+ser dado como concluído — não ficou de fora por descuido. O recurso "Spend Limits" exige conta
+em tier **pago**, com permissão de *organization owner*; não existe no tier **gratuito**, que é
+o que este projeto usa (os limites de 8000 tokens/minuto e 200000 tokens/dia, já documentados
+em [ADR-0006](0006-troca-de-provedor-llm-para-groq.md) e
+[ADR-0009](0009-golden-dataset-e-metricas-de-avaliacao.md), são exatamente a característica
+desse tier). Ou seja: não há um teto de gasto para configurar aqui, porque o tier gratuito não
+gera cobrança monetária — só nega a requisição (`429`) quando a cota de uso (RPM/TPM/TPD) é
+excedida.
+
+Isso não é "sem proteção de custo", é proteção **por construção, não por configuração
+manual**: nenhuma chamada excedente é cobrada, só falha — a mesma categoria de falha de
+infraestrutura que `scripts/run_eval.py` já mede e exclui das métricas de qualidade (ver
+ADR-0009). O rate limiting por IP em `POST /ask` (`5/minute`, `slowapi`) continua sendo a
+segunda camada real, mas seu papel passa a ser outro: reduzir o quanto um único
+visitante/bot esgota a cota *compartilhada* (RPM/TPM/TPD) do tier gratuito, não proteger contra
+"gasto monetário" — que não existe neste tier.
+
+**Watch item, não resolvido para sempre**: se este projeto migrar para o tier pago da Groq (ex.
+para contornar os limites de RPM/TPM que já causaram flakiness documentada em ADR-0009),
+configurar um "Spend Limit" real nesse momento passa a ser um pré-requisito antes de divulgar o
+link publicamente de novo — a ausência de teto de gasto hoje é uma consequência de estar no
+tier gratuito, não uma decisão que continua válida se o tier mudar.
+
 ## Decisão
 
 1. **`render.yaml`** declara o Web Service como blueprint (`runtime: docker`, build a partir do
@@ -157,10 +186,16 @@ Trade-offs explícitos dessa segunda troca:
      (ou bot) esgotar o rate limit da Groq (ver
      [ADR-0009](0009-golden-dataset-e-metricas-de-avaliacao.md)) ou, pior, gerar uma conta
      inesperada se a chave configurada deixar de ser gratuita.
-   - **Lembrete explícito (não automatizável por código) em `README.md`**: configurar um teto de
-     gasto ("spend limit"/"usage limit") na chave do provedor de LLM no próprio painel da Groq
-     antes de divulgar o link — rate limiting por IP reduz o volume de chamadas, mas não
-     impede múltiplos IPs, nem substitui um teto de gasto real na origem do custo.
+   - **Tier gratuito da Groq como proteção de custo por construção, não por configuração
+     manual de teto de gasto** (ver "Atualização 3" acima): o free tier não gera cobrança
+     monetária — só nega a requisição quando a cota de uso (RPM/TPM/TPD, já documentada em
+     [ADR-0006](0006-troca-de-provedor-llm-para-groq.md)/[ADR-0009](0009-golden-dataset-e-metricas-de-avaliacao.md))
+     é excedida. O recurso "Spend Limits" da Groq
+     ([console.groq.com/docs/spend-limits](https://console.groq.com/docs/spend-limits)) foi
+     verificado e exige tier pago — indisponível aqui, não ignorado por descuido (ver
+     `README.md` para o mesmo lembrete resumido). O rate limiting por IP acima é a segunda
+     camada real: reduz o quanto um único visitante/bot esgota essa cota compartilhada, mas não
+     impede abuso distribuído (múltiplos IPs).
 
 ## Consequências
 
@@ -172,9 +207,10 @@ Trade-offs explícitos dessa segunda troca:
 - A imagem Docker continua sendo a única unidade de deploy (dev local via `docker compose up` e
   produção via Render usam exatamente o mesmo `Dockerfile`) — nenhuma lógica condicional de
   "ambiente de produção" precisou entrar no código da aplicação.
-- Os guard-rails de rate limit + lembrete de teto de gasto são a barreira mínima, mas concreta,
-  entre "link no ar" e "link responsavelmente divulgável" — sem eles, publicar o link seria
-  assumir um risco de custo aberto.
+- Os guard-rails de rate limit por IP + tier gratuito da Groq (sem cobrança monetária por
+  construção, ver "Atualização 3") são a barreira mínima, mas concreta, entre "link no ar" e
+  "link responsavelmente divulgável" — sem eles, publicar o link seria assumir um risco aberto
+  de esgotamento de cota compartilhada, sem controle algum.
 
 ### Negativas / Trade-offs
 
@@ -195,9 +231,15 @@ Trade-offs explícitos dessa segunda troca:
   ausente, mas também significa que quem for depurar um deploy quebrado precisa olhar os logs
   do container no painel do Render, não uma resposta de erro em alguma URL.
 - **`5/minute` por IP é uma heurística, não uma solução de autenticação/autorização.** Não
-  impede abuso distribuído (múltiplos IPs) nem substitui o teto de gasto configurado
-  manualmente na chave do provedor — é uma primeira barreira, pensada para o volume de uma demo
-  de portfólio, não para tráfego adversarial sério.
+  impede abuso distribuído (múltiplos IPs) — é a única camada de proteção além do próprio
+  limite do tier gratuito da Groq, que não é configurável e não gera cobrança monetária (ver
+  "Atualização 3"); pensada para o volume de uma demo de portfólio, não para tráfego
+  adversarial sério.
+- **Sem teto de gasto configurável enquanto este projeto estiver no tier gratuito da Groq**
+  (ver "Atualização 3") — não é uma lacuna deste projeto, é uma característica do tier: não há
+  cobrança monetária para limitar. Isto deixa de valer se o projeto migrar para tier pago: a
+  partir daí, configurar um "Spend Limit" real volta a ser um pré-requisito antes de qualquer
+  nova divulgação pública do link.
 - **Escolha de plataforma amarrada ao estado atual dos planos gratuitos de cada provedor**
   (setembro/2026) — Railway, Fly.io e Hugging Face Spaces podem voltar a oferecer um tier
   gratuito compatível no futuro, e o Render pode mudar o seu; esta decisão não é permanente, só
