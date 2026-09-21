@@ -1,0 +1,56 @@
+# Blueprint de deploy do Render (https://render.com/docs/blueprint-spec) para o demo público
+# deste projeto. Ver docs/adrs/0010-hospedagem-do-demo-publico.md para o porquê do Render (e
+# não Railway/Fly.io/Hugging Face Spaces) e o passo a passo em README.md.
+#
+# Este arquivo só declara a infraestrutura (o *que* existe). Nenhuma chave/segredo vive aqui —
+# `sync: false` abaixo força o Render a pedir o valor no painel, na criação do serviço, em vez
+# de aceitar um valor deste arquivo versionado (ver AGENTS.md: nunca commitar segredos).
+services:
+  - type: web
+    name: data-agent
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      # Render injeta PORT automaticamente em runtime; o Dockerfile já escuta em
+      # `${PORT:-8000}` (ver Dockerfile), então nada a fazer aqui além de documentar.
+      #
+      # As 5 variáveis abaixo (AWS_*/S3_*) são lidas em RUNTIME, no boot do container, por
+      # `data_agent.warehouse_fetch` (chamado pelo `CMD` do Dockerfile antes do `uvicorn`) —
+      # nunca durante o build. Ver docs/adrs/0010-hospedagem-do-demo-publico.md, seção
+      # "Atualização 2": uma versão anterior deste arquivo as passava como build args, mas
+      # isso gravava as credenciais em texto puro no histórico de camadas da imagem
+      # (confirmado com `docker history --no-trunc`) — corrigido movendo o fetch para o boot,
+      # onde a credencial só existe como variável de ambiente do processo em execução.
+      # Credencial IAM com permissão mínima (só `s3:GetObject` no bucket/chave abaixo) — ver
+      # README.md para o passo a passo de criação do bucket/IAM/upload.
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: AWS_REGION
+        sync: false
+      - key: S3_BUCKET_NAME
+        sync: false
+      - key: S3_OBJECT_KEY
+        value: warehouse.duckdb
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_TIMEOUT_SECONDS
+        value: "30.0"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LANGFUSE_PUBLIC_KEY
+        sync: false
+      - key: LANGFUSE_SECRET_KEY
+        sync: false
+      - key: LANGFUSE_HOST
+        value: https://us.cloud.langfuse.com
+      # Caminho onde `data_agent.warehouse_fetch` baixa (e `data_agent.db` depois lê) o
+      # warehouse DENTRO do container. O plano free do Render não tem disco persistente nem
+      # volume do host, então este caminho começa vazio a cada boot — diferente do volume
+      # montado em docker-compose.yml, que só existe localmente.
+      - key: DUCKDB_PATH
+        value: /app/data/warehouse.duckdb

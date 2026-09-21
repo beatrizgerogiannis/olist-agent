@@ -19,6 +19,8 @@ dependencies = [
     "opentelemetry-exporter-otlp",
     "structlog",
     "sqlglot>=30.18.0",
+    "slowapi>=0.1.10",
+    "boto3>=1.43.98",
 ]
 
 [dependency-groups]

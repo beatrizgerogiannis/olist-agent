@@ -278,3 +278,29 @@ def test_ask_parser_model_provider_error_as_content_returns_502_as_provider_erro
     # Mesmo numa falha, se algum token foi de fato gasto antes dela (ex. get_schema
     # + tentativas de query_sales antes do parser_model falhar), isso fica visível.
     assert response.headers["x-total-tokens"] == "777"
+
+
+def test_ask_beyond_rate_limit_returns_429(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # _ASK_RATE_LIMIT (data_agent/api.py) é "5/minute" por IP — os 5 primeiros
+    # passam, o 6º dentro da mesma janela deve ser barrado antes de chamar o
+    # agente (ver docs/adrs/0010-hospedagem-do-demo-publico.md).
+    answer = AgentAnswer(status="answered", answer="42.", confidence=0.9)
+    _use_fake_agent(monkeypatch, _FakeAgent(result=answer))
+
+    for _ in range(5):
+        response = client.post("/ask", json={"question": "Qual o total de vendas?"})
+        assert response.status_code == status.HTTP_200_OK
+
+    response = client.post("/ask", json={"question": "Qual o total de vendas?"})
+
+    assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+
+
+def test_root_serves_static_chat_ui_with_cold_start_warning(client: TestClient) -> None:
+    response = client.get("/")
+
+    assert response.status_code == status.HTTP_200_OK
+    assert "text/html" in response.headers["content-type"]
+    assert "cold start" in response.text.lower()

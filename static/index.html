@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>data-agent · Olist</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f6f7f9;
+      --fg: #1a1a1a;
+      --muted: #6b7280;
+      --border: #d9dce1;
+      --bubble-user: #2563eb;
+      --bubble-user-fg: #ffffff;
+      --bubble-agent: #ffffff;
+      --bubble-agent-fg: #1a1a1a;
+      --warn-bg: #fff4d6;
+      --warn-border: #e8c766;
+      --error-bg: #fdeaea;
+      --error-border: #e8a5a5;
+      --error-fg: #8a1f1f;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #14161a;
+        --fg: #e7e9ec;
+        --muted: #9aa1ac;
+        --border: #2a2e35;
+        --bubble-user: #3b6fe0;
+        --bubble-user-fg: #ffffff;
+        --bubble-agent: #1f2329;
+        --bubble-agent-fg: #e7e9ec;
+        --warn-bg: #3a2f10;
+        --warn-border: #7a5f18;
+        --error-bg: #3a1616;
+        --error-border: #7a3030;
+        --error-fg: #ff9d9d;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      display: flex;
+      justify-content: center;
+      min-height: 100vh;
+    }
+    main {
+      width: 100%;
+      max-width: 720px;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+      padding: 16px;
+    }
+    header h1 {
+      font-size: 1.25rem;
+      margin: 0 0 4px;
+    }
+    header p {
+      margin: 0 0 12px;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+    .cold-start-warning {
+      background: var(--warn-bg);
+      border: 1px solid var(--warn-border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 0.85rem;
+      margin-bottom: 16px;
+    }
+    #history {
+      flex: 1;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding-bottom: 12px;
+    }
+    .msg {
+      max-width: 85%;
+      padding: 10px 14px;
+      border-radius: 14px;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      font-size: 0.95rem;
+      line-height: 1.4;
+    }
+    .msg.user {
+      align-self: flex-end;
+      background: var(--bubble-user);
+      color: var(--bubble-user-fg);
+      border-bottom-right-radius: 4px;
+    }
+    .msg.agent {
+      align-self: flex-start;
+      background: var(--bubble-agent);
+      color: var(--bubble-agent-fg);
+      border: 1px solid var(--border);
+      border-bottom-left-radius: 4px;
+    }
+    .msg.error {
+      align-self: flex-start;
+      background: var(--error-bg);
+      color: var(--error-fg);
+      border: 1px solid var(--error-border);
+      border-bottom-left-radius: 4px;
+    }
+    .msg .meta {
+      display: block;
+      margin-top: 6px;
+      font-size: 0.75rem;
+      opacity: 0.75;
+    }
+    form {
+      display: flex;
+      gap: 8px;
+      padding-top: 8px;
+      border-top: 1px solid var(--border);
+    }
+    input[type="text"] {
+      flex: 1;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bubble-agent);
+      color: var(--fg);
+      font-size: 0.95rem;
+    }
+    input[type="text"]:focus {
+      outline: 2px solid var(--bubble-user);
+      outline-offset: -1px;
+    }
+    button {
+      padding: 10px 18px;
+      border-radius: 8px;
+      border: none;
+      background: var(--bubble-user);
+      color: var(--bubble-user-fg);
+      font-size: 0.95rem;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>data-agent · Olist</h1>
+      <p>Pergunte em português sobre vendas, entregas, pagamentos e avaliações da base Olist Brazilian E-Commerce.</p>
+    </header>
+
+    <div class="cold-start-warning">
+      ⚠️ Este demo roda em um plano gratuito: se o serviço estiver "dormindo", a
+      <strong>primeira resposta pode demorar até 1 minuto</strong> (cold start). As próximas são
+      bem mais rápidas.
+    </div>
+
+    <div id="history" role="log" aria-live="polite"></div>
+
+    <form id="ask-form">
+      <input
+        id="question"
+        type="text"
+        name="question"
+        placeholder="Ex.: Qual o total de vendas em 2017?"
+        autocomplete="off"
+        required
+      />
+      <button id="submit-btn" type="submit">Perguntar</button>
+    </form>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      const historyEl = document.getElementById("history");
+      const formEl = document.getElementById("ask-form");
+      const inputEl = document.getElementById("question");
+      const buttonEl = document.getElementById("submit-btn");
+
+      function appendMessage(kind, text, metaText) {
+        const bubble = document.createElement("div");
+        bubble.className = "msg " + kind;
+        bubble.textContent = text;
+        if (metaText) {
+          const meta = document.createElement("span");
+          meta.className = "meta";
+          meta.textContent = metaText;
+          bubble.appendChild(meta);
+        }
+        historyEl.appendChild(bubble);
+        historyEl.scrollTop = historyEl.scrollHeight;
+        return bubble;
+      }
+
+      const STATUS_LABEL = {
+        answered: "respondida",
+        insufficient_data: "dados insuficientes",
+        out_of_scope: "fora de escopo",
+      };
+
+      async function ask(question) {
+        const response = await fetch("/ask", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question: question }),
+        });
+
+        let body = null;
+        try {
+          body = await response.json();
+        } catch (err) {
+          body = null;
+        }
+
+        if (!response.ok) {
+          if (response.status === 429) {
+            throw new Error("Muitas perguntas em pouco tempo. Espere um minuto e tente de novo.");
+          }
+          if (response.status === 504) {
+            throw new Error("O modelo demorou demais para responder (timeout). Tente de novo.");
+          }
+          const detail = body && body.detail ? body.detail : "Falha ao consultar o agente.";
+          throw new Error(detail);
+        }
+
+        return body;
+      }
+
+      formEl.addEventListener("submit", function (event) {
+        event.preventDefault();
+
+        const question = inputEl.value.trim();
+        if (!question) {
+          return;
+        }
+
+        appendMessage("user", question);
+        inputEl.value = "";
+        inputEl.disabled = true;
+        buttonEl.disabled = true;
+
+        const pending = appendMessage("agent", "Pensando... (pode levar até 1 minuto no cold start)");
+
+        ask(question)
+          .then(function (answer) {
+            pending.remove();
+            const statusLabel = STATUS_LABEL[answer.status] || answer.status;
+            const confidencePct = Math.round((answer.confidence || 0) * 100);
+            appendMessage("agent", answer.answer, statusLabel + " · confiança " + confidencePct + "%");
+          })
+          .catch(function (err) {
+            pending.remove();
+            appendMessage("error", err.message || "Erro inesperado.");
+          })
+          .finally(function () {
+            inputEl.disabled = false;
+            buttonEl.disabled = false;
+            inputEl.focus();
+          });
+      });
+    })();
+  </script>
+</body>
+</html>

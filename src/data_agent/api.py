@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 import groq
@@ -16,8 +17,13 @@ import structlog
 from agno.agent import Agent
 from agno.exceptions import ModelProviderError
 from agno.run.agent import RunOutput
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
 
 from data_agent.agent import build_agent
 from data_agent.config import get_settings
@@ -57,6 +63,31 @@ configure_observability()
 logger = structlog.get_logger(__name__)
 
 app = FastAPI(title="data-agent", version="0.1.0")
+
+# Rate limit por IP em `/ask` (ver docs/adrs/0010-hospedagem-do-demo-publico.md): a única rota
+# que dispara uma chamada real (cara, e paga) ao provedor de LLM. Um valor fixo de código, não
+# uma variável de ambiente (mesmo raciocínio do id do modelo em ``agent.py`` — ver
+# ADR-0006): "poucas requisições por minuto" é suficiente para uma demo de portfólio, e expor
+# isso como configuração sugeriria um caso de uso (afinar rate limit em produção) que este
+# projeto não tem. ``/health`` fica de fora — é só o healthcheck do Docker/Render.
+_ASK_RATE_LIMIT = "5/minute"
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+
+def _handle_rate_limit_exceeded(request: Request, exc: Exception) -> Response:
+    """Adapta ``slowapi._rate_limit_exceeded_handler`` à assinatura que
+    ``Starlette.add_exception_handler`` exige (``exc: Exception``, não
+    ``exc: RateLimitExceeded``) — o registro abaixo só chama isto para exceções
+    ``RateLimitExceeded``, então o ``isinstance`` nunca falha em uso normal.
+    """
+    assert isinstance(exc, RateLimitExceeded)
+    return _rate_limit_exceeded_handler(request, exc)
+
+
+app.add_exception_handler(RateLimitExceeded, _handle_rate_limit_exceeded)
+app.add_middleware(SlowAPIMiddleware)
 
 
 @lru_cache
@@ -138,10 +169,13 @@ def _is_provider_error_payload(content: object) -> bool:
 
 
 @app.post("/ask", response_model=AgentAnswer)
-def ask(request: AskRequest, response: Response) -> AgentAnswer:
-    """Responde ``request.question`` via o agente e suas tools de SQL controlado.
+@limiter.limit(_ASK_RATE_LIMIT)
+def ask(request: Request, payload: AskRequest, response: Response) -> AgentAnswer:
+    """Responde ``payload.question`` via o agente e suas tools de SQL controlado.
 
-    ``request`` já chega validado como ``AskRequest`` (FastAPI devolve 422
+    ``request`` (o ``Request`` do Starlette) só existe aqui para o
+    ``@limiter.limit`` acima identificar o IP de origem — não é usado no corpo da
+    função. ``payload`` já chega validado como ``AskRequest`` (FastAPI devolve 422
     automaticamente para um corpo malformado antes de esta função rodar) e a
     resposta é validada como ``AgentAnswer`` na saída. ``status="insufficient_data"``
     e ``status="out_of_scope"`` são decisões válidas do agente e voltam com 200,
@@ -155,15 +189,15 @@ def ask(request: AskRequest, response: Response) -> AgentAnswer:
     custo em tokens da chamada (ver ``_total_tokens``) — não existe nos casos em
     que ``agent.run()`` levanta antes de devolver nada.
     """
-    logger.info("agent_call_started", question=request.question)
+    logger.info("agent_call_started", question=payload.question)
     agent = get_agent()
     try:
-        run_output = agent.run(request.question)
+        run_output = agent.run(payload.question)
     except ModelProviderError as exc:
         is_timeout = isinstance(exc.__cause__, groq.APITimeoutError)
         logger.error(
             "agent_call_model_error",
-            question=request.question,
+            question=payload.question,
             error=str(exc),
             timeout=is_timeout,
         )
@@ -173,7 +207,7 @@ def ask(request: AskRequest, response: Response) -> AgentAnswer:
             ) from exc
         raise HTTPException(status_code=502, detail=_PROVIDER_ERROR_DETAIL) from exc
     except Exception as exc:
-        logger.error("agent_call_failed", question=request.question, error=str(exc))
+        logger.error("agent_call_failed", question=payload.question, error=str(exc))
         raise HTTPException(
             status_code=502,
             detail="Falha inesperada ao executar o agente ou uma de suas tools.",
@@ -186,7 +220,7 @@ def ask(request: AskRequest, response: Response) -> AgentAnswer:
         if _is_provider_error_payload(run_output.content):
             logger.error(
                 "agent_call_provider_error_as_content",
-                question=request.question,
+                question=payload.question,
                 content=run_output.content,
                 total_tokens=total_tokens,
             )
@@ -195,7 +229,7 @@ def ask(request: AskRequest, response: Response) -> AgentAnswer:
             )
         logger.error(
             "agent_call_invalid_output",
-            question=request.question,
+            question=payload.question,
             content=run_output.content,
             total_tokens=total_tokens,
         )
@@ -207,10 +241,20 @@ def ask(request: AskRequest, response: Response) -> AgentAnswer:
 
     logger.info(
         "agent_call_completed",
-        question=request.question,
+        question=payload.question,
         status=run_output.content.status,
         total_tokens=total_tokens,
     )
     if total_tokens is not None:
         response.headers[_HEADER_TOTAL_TOKENS] = str(total_tokens)
     return run_output.content
+
+
+# Serve a UI de chat estática (ver static/index.html) na mesma imagem Docker/processo da API —
+# sem segundo serviço. Montado por último para que ``/health`` e ``/ask`` (declaradas acima)
+# continuem resolvendo primeiro; o mount só responde pelos paths que essas rotas não capturam.
+# Caminho absoluto (não relativo ao cwd) porque este módulo é importado tanto a partir da raiz
+# do repo (dev local, ``uv run uvicorn ...``) quanto de dentro da imagem Docker — em ambos os
+# casos, ``static/`` fica dois níveis acima deste arquivo (``src/data_agent/api.py`` -> raiz).
+_STATIC_DIR = Path(__file__).resolve().parents[2] / "static"
+app.mount("/", StaticFiles(directory=_STATIC_DIR, html=True), name="static")

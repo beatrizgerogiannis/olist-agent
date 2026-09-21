@@ -10,14 +10,18 @@ services:
       # montado — sobrescreve o valor de .env (que é relativo ao host).
       DUCKDB_PATH: /app/data/warehouse.duckdb
     volumes:
-      # Persiste data/warehouse.duckdb (gerado localmente por
-      # `uv run python scripts/load_data.py`, ver AGENTS.md) entre reinícios
-      # do container — a imagem não embute o warehouse.
+      # O warehouse do host cobre o caminho que data_agent.warehouse_fetch checa no boot do
+      # container (ver Dockerfile e docs/adrs/0010-hospedagem-do-demo-publico.md) — como o
+      # arquivo já existe aí quando o container sobe, o fetch do S3 nunca dispara localmente,
+      # então as variáveis AWS_*/S3_* no .env nem precisam estar preenchidas para
+      # `docker compose up` funcionar (build ou não). Isto também garante que você sempre roda
+      # contra o arquivo mais recente gerado por `uv run python scripts/load_data.py` (ver
+      # AGENTS.md), sem precisar rebuildar a imagem.
       - ./data/warehouse.duckdb:/app/data/warehouse.duckdb
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
       interval: 30s
       timeout: 5s
-      start_period: 10s
+      start_period: 60s
       retries: 3
     restart: unless-stopped
