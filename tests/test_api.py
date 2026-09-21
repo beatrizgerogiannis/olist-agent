@@ -34,17 +34,26 @@ class _FakeAgent:
         self,
         *,
         result: Any = None,
+        results: list[Any] | None = None,
         exception: Exception | None = None,
         metrics: Any = None,
     ) -> None:
-        self._result = result
+        # `results` (uma lista, um item por chamada de `agent.run()`) existe só
+        # para os testes do retry de `_is_tool_use_failed_payload` (ver
+        # `data_agent/api.py::ask`), onde a 1ª e a 2ª chamada precisam devolver
+        # conteúdos diferentes. Todo teste que só chama `agent.run()` uma vez
+        # continua usando `result` (equivalente a `results=[result]`).
+        self._results = results if results is not None else [result]
         self._exception = exception
         self._metrics = metrics
+        self._call_count = 0
 
     def run(self, question: str) -> _FakeRunOutput:
         if self._exception is not None:
             raise self._exception
-        return _FakeRunOutput(content=self._result, metrics=self._metrics)
+        index = min(self._call_count, len(self._results) - 1)
+        self._call_count += 1
+        return _FakeRunOutput(content=self._results[index], metrics=self._metrics)
 
 
 @pytest.fixture
@@ -278,6 +287,73 @@ def test_ask_parser_model_provider_error_as_content_returns_502_as_provider_erro
     # Mesmo numa falha, se algum token foi de fato gasto antes dela (ex. get_schema
     # + tentativas de query_sales antes do parser_model falhar), isso fica visível.
     assert response.headers["x-total-tokens"] == "777"
+
+
+_TOOL_USE_FAILED_ERROR = (
+    '{"error":{"message":"Tool call validation failed: tool call validation '
+    "failed: attempted to call tool 'agent_answer' which was not in "
+    'request.tools","type":"invalid_request_error","code":"tool_use_failed",'
+    '"failed_generation":"{\\"name\\": \\"agent_answer\\", \\"arguments\\": '
+    '{\\"status\\": \\"answered\\"}}"}}'
+)
+
+
+def test_ask_tool_use_failed_error_retries_once_and_returns_success(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Reproduz o incidente de 2026-09-21 ("em 2017, quantas vendas houve?", ver
+    # data_agent/api.py::_is_tool_use_failed_payload e o teste equivalente em
+    # tests/test_agent.py que reproduz o mesmo erro com um fake Model): o
+    # modelo principal tenta chamar a tool inexistente `agent_answer` e a Groq
+    # rejeita a chamada. É um erro de geração de um único turno, não de
+    # infraestrutura — `ask` tenta de novo automaticamente antes de desistir, e
+    # aqui a 2ª tentativa tem sucesso.
+    answer = AgentAnswer(
+        status="answered",
+        answer="45101 vendas foram registradas em 2017.",
+        confidence=0.99,
+        sql_used=[
+            "SELECT COUNT(*) FROM orders WHERE "
+            "EXTRACT(YEAR FROM order_purchase_timestamp) = 2017"
+        ],
+        sources=[SourceReference(table="orders", row_count=1)],
+    )
+    _use_fake_agent(
+        monkeypatch, _FakeAgent(results=[_TOOL_USE_FAILED_ERROR, answer])
+    )
+
+    response = client.post("/ask", json={"question": "em 2017, quantas vendas houve?"})
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["status"] == "answered"
+    assert body["answer"] == answer.answer
+
+
+def test_ask_tool_use_failed_error_persisting_after_retry_returns_insufficient_data(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Mesmo cenário do teste acima, mas o erro `tool_use_failed` se repete na
+    # retentativa: em vez de propagar como 502 para quem usa a demo pública,
+    # `ask` devolve uma `AgentAnswer` honesta com `status="insufficient_data"`
+    # e 200 (mesma filosofia de ADR-0005 — degradar graciosamente em vez de
+    # expor erro cru de infraestrutura).
+    fake_metrics = SimpleNamespace(total_tokens=555)
+    _use_fake_agent(
+        monkeypatch,
+        _FakeAgent(
+            results=[_TOOL_USE_FAILED_ERROR, _TOOL_USE_FAILED_ERROR],
+            metrics=fake_metrics,
+        ),
+    )
+
+    response = client.post("/ask", json={"question": "em 2017, quantas vendas houve?"})
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["status"] == "insufficient_data"
+    assert body["confidence"] == 0.0
+    assert response.headers["x-total-tokens"] == "555"
 
 
 def test_ask_beyond_rate_limit_returns_429(

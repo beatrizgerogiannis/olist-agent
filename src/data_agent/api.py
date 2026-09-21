@@ -168,6 +168,46 @@ def _is_provider_error_payload(content: object) -> bool:
     return isinstance(parsed, dict) and isinstance(parsed.get("error"), dict)
 
 
+def _is_tool_use_failed_payload(content: object) -> bool:
+    """``True`` se ``content`` for o erro cru ``tool_use_failed`` da Groq: o
+    *modelo principal* (confirmado via trace do Langfuse do incidente de
+    2026-09-21, pergunta "em 2017, quantas vendas houve?", span de
+    2026-09-21T11:59:18Z — não o ``parser_model``, que sequer chegou a rodar)
+    tenta emitir uma ``tool_call`` para ``agent_answer`` (o nome, em snake_case,
+    da classe ``AgentAnswer`` de ``output_schema``) mesmo sem essa tool estar
+    registrada na chamada (só ``get_schema``/``query_sales`` estão), e a Groq
+    rejeita a chamada inteira com ``code="tool_use_failed"`` antes do
+    ``parser_model`` (ver docs/adrs/0006-troca-de-provedor-llm-para-groq.md)
+    sequer rodar.
+
+    Causa raiz: quando ``parser_model`` está setado, ``agno.utils.prompts.
+    get_response_model_format_prompt`` injeta os nomes dos campos de
+    ``output_schema`` na system message do modelo principal, pedindo para ele
+    "mencionar" esses tópicos em prosa (não JSON) — combinado com tools reais
+    registradas na mesma chamada e o nome ``AgentAnswer`` citado em
+    ``prompts.SYSTEM_PROMPT``, isso confunde o ``openai/gpt-oss-120b`` (quirk
+    documentado de modelos open-weight com tool-calling instável na Groq, ex.
+    langchain-ai/langchain#34155 e a thread "GPT-oss-120b hallucinates badly"
+    da comunidade Groq) a tratar o nome do schema como uma tool a chamar.
+
+    Ao contrário do que ``_is_provider_error_payload`` cobre (rate limit, etc.
+    — falha de infraestrutura onde repetir na hora não ajuda), este é um erro
+    de *geração* de um único turno: o ``failed_generation`` do erro já contém a
+    resposta correta, só mal-empacotada como ``tool_call``, e a chance do
+    modelo não repetir exatamente esse mesmo erro numa nova tentativa
+    independente é boa — por isso ``ask`` abaixo trata este caso específico com
+    um retry automático em vez de falhar direto.
+    """
+    if not isinstance(content, str):
+        return False
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return False
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    return isinstance(error, dict) and error.get("code") == "tool_use_failed"
+
+
 @app.post("/ask", response_model=AgentAnswer)
 @limiter.limit(_ASK_RATE_LIMIT)
 def ask(request: Request, payload: AskRequest, response: Response) -> AgentAnswer:
@@ -182,7 +222,11 @@ def ask(request: Request, payload: AskRequest, response: Response) -> AgentAnswe
     como qualquer outra ``AgentAnswer`` — só uma falha real de infraestrutura
     (timeout do modelo, erro do provedor — levantado como exceção ou, no caso do
     ``parser_model``, entregue como conteúdo cru, ver ``_is_provider_error_payload``
-    — ou uma tool/exceção que escapou do agente) vira um erro HTTP.
+    — ou uma tool/exceção que escapou do agente) vira um erro HTTP. A exceção é o
+    erro ``tool_use_failed`` coberto por ``_is_tool_use_failed_payload`` (ver sua
+    docstring): tratado como falha transitória do modelo, não de infraestrutura
+    — uma nova tentativa, e se ela também falhar, ``status="insufficient_data"``
+    com 200 em vez de erro HTTP.
 
     Quando ``run_output`` chega a existir (sucesso ou os dois ramos de "saída não
     estruturada" abaixo), a resposta carrega o header ``X-Total-Tokens`` com o
@@ -193,6 +237,17 @@ def ask(request: Request, payload: AskRequest, response: Response) -> AgentAnswe
     agent = get_agent()
     try:
         run_output = agent.run(payload.question)
+        if _is_tool_use_failed_payload(run_output.content):
+            # Ver docstring de `_is_tool_use_failed_payload`: erro de geração de
+            # um único turno (o modelo hallucina uma tool_call para o nome do
+            # output_schema), não de infraestrutura — vale a pena tentar de novo
+            # antes de desistir.
+            logger.warning(
+                "agent_call_tool_use_failed_retry",
+                question=payload.question,
+                content=run_output.content,
+            )
+            run_output = agent.run(payload.question)
     except ModelProviderError as exc:
         is_timeout = isinstance(exc.__cause__, groq.APITimeoutError)
         logger.error(
@@ -217,6 +272,32 @@ def ask(request: Request, payload: AskRequest, response: Response) -> AgentAnswe
     error_headers = {_HEADER_TOTAL_TOKENS: str(total_tokens)} if total_tokens is not None else {}
 
     if not isinstance(run_output.content, AgentAnswer):
+        if _is_tool_use_failed_payload(run_output.content):
+            # A retentativa em `ask` acima também caiu no mesmo erro `tool_use_failed`
+            # (ver `_is_tool_use_failed_payload`) — em vez de expor isso como 502 para
+            # quem usa a demo pública, devolve uma `AgentAnswer` honesta com 200: é o
+            # mesmo tipo de degradação graciosa que ADR-0005 já define para
+            # `insufficient_data`, só que a causa aqui é uma falha pontual do modelo
+            # em formatar a resposta, não falta de dado.
+            logger.error(
+                "agent_call_tool_use_failed_persisted_after_retry",
+                question=payload.question,
+                content=run_output.content,
+                total_tokens=total_tokens,
+            )
+            if total_tokens is not None:
+                response.headers[_HEADER_TOTAL_TOKENS] = str(total_tokens)
+            return AgentAnswer(
+                status="insufficient_data",
+                answer=(
+                    "O modelo de linguagem teve uma falha transitória ao formatar a "
+                    "resposta (mesmo após uma nova tentativa); não foi possível "
+                    "confirmar a resposta com segurança agora. Tente novamente."
+                ),
+                confidence=0.0,
+                sql_used=[],
+                sources=[],
+            )
         if _is_provider_error_payload(run_output.content):
             logger.error(
                 "agent_call_provider_error_as_content",

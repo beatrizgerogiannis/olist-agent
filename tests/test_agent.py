@@ -144,6 +144,103 @@ def test_agent_run_with_invalid_json_logs_warning_and_returns_raw_string(
 
 
 @dataclass
+class _ToolUseFailedModel(Model):
+    """Fake ``Model`` que devolve o erro cru ``tool_use_failed`` da Groq como
+    ``content`` (não como exceção levantada).
+
+    Reproduz, sem gastar tokens reais da Groq, o incidente confirmado via trace
+    do Langfuse de 2026-09-21 (pergunta "em 2017, quantas vendas houve?", span
+    de 2026-09-21T11:59:18Z, ``data_agent/api.py::_is_tool_use_failed_payload``):
+    o modelo principal (não o ``parser_model``) tenta emitir uma ``tool_call``
+    para ``agent_answer`` — o nome, em snake_case, da classe ``AgentAnswer`` de
+    ``output_schema`` — mesmo sem essa tool estar registrada na chamada, e a
+    Groq rejeita a chamada inteira. O ``failed_generation`` do erro real já
+    contém a resposta correta (45101, com ``sql_used``/``sources`` preenchidos),
+    só mal-empacotada como ``tool_call`` em vez de texto.
+    """
+
+    id: str = "fake-tool-use-failed-model"
+    content: str = json.dumps(
+        {
+            "error": {
+                "message": (
+                    "Tool call validation failed: tool call validation failed: "
+                    "attempted to call tool 'agent_answer' which was not in "
+                    "request.tools"
+                ),
+                "type": "invalid_request_error",
+                "code": "tool_use_failed",
+                "failed_generation": json.dumps(
+                    {
+                        "name": "agent_answer",
+                        "arguments": {
+                            "status": "answered",
+                            "answer": "45101 vendas foram registradas em 2017.",
+                            "confidence": 0.99,
+                            "sql_used": [
+                                "SELECT COUNT(*) FROM orders WHERE "
+                                "EXTRACT(YEAR FROM order_purchase_timestamp) = 2017"
+                            ],
+                            "sources": [{"table": "orders", "rows_returned": 1}],
+                        },
+                    }
+                ),
+            }
+        }
+    )
+
+    def invoke(self, *args: Any, **kwargs: Any) -> ModelResponse:
+        return ModelResponse(role="assistant", content=self.content)
+
+    async def ainvoke(self, *args: Any, **kwargs: Any) -> ModelResponse:
+        return self.invoke(*args, **kwargs)
+
+    def invoke_stream(self, *args: Any, **kwargs: Any) -> Iterator[ModelResponse]:
+        yield self.invoke(*args, **kwargs)
+
+    async def ainvoke_stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[ModelResponse]:
+        yield self.invoke(*args, **kwargs)
+
+    def _parse_provider_response(self, response: Any, **kwargs: Any) -> ModelResponse:
+        return response
+
+    def _parse_provider_response_delta(self, response: Any) -> ModelResponse:
+        return response
+
+
+def test_agent_run_with_tool_use_failed_error_logs_and_returns_raw_error_content(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Confirma por teste (não só lendo o trace do Langfuse) que o erro
+    ``tool_use_failed`` da Groq (ver ``_ToolUseFailedModel``) chega ao chamador
+    de ``agent.run()`` pelo mesmo caminho silencioso que
+    ``test_agent_run_with_invalid_json_logs_warning_and_returns_raw_string``
+    já prova para JSON malformado: sem exceção, só um warning e o corpo de erro
+    cru como ``content`` (``str``, não ``AgentAnswer``). É esse comportamento
+    que ``data_agent/api.py::_is_tool_use_failed_payload`` (e o retry em
+    ``ask``) dependem para detectar e mitigar o caso — ver
+    ``tests/test_api.py::test_ask_tool_use_failed_error_retries_once_and_returns_success``
+    e o teste seguinte para a mitigação em si.
+    """
+    model = _ToolUseFailedModel()
+    agent = Agent(
+        model=model,
+        tools=[get_schema, query_sales],
+        output_schema=AgentAnswer,
+        instructions=SYSTEM_PROMPT,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="agno"):
+        result = agent.run("em 2017, quantas vendas houve?")
+
+    assert not isinstance(result.content, AgentAnswer)
+    assert result.content == model.content
+    parsed_error = json.loads(result.content)["error"]
+    assert parsed_error["code"] == "tool_use_failed"
+    assert "agent_answer" in parsed_error["message"]
+
+
+@dataclass
 class _ToolFailureModel(Model):
     """Fake ``Model`` cuja 1ª resposta pede uma tool REAL que vai falhar de verdade.
 
