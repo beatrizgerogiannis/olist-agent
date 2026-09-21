@@ -13,7 +13,7 @@ from data_agent.agent import build_agent
 from data_agent.config import get_settings
 from data_agent.prompts import SYSTEM_PROMPT
 from data_agent.schemas import AgentAnswer
-from data_agent.tools.sql_tools import get_schema, query_sales
+from data_agent.tools.sql_tools import query_sales
 
 
 @pytest.fixture(autouse=True)
@@ -33,9 +33,15 @@ def test_build_agent_returns_an_agno_agent() -> None:
 
 
 def test_build_agent_wires_the_sql_controlled_tools() -> None:
+    # `get_schema` não é mais uma tool do agente principal desde 2026-09-22
+    # (otimização de latência): o schema é estático e agora está embutido em
+    # `prompts.SYSTEM_PROMPT` como texto — ver docstring de `build_agent` e
+    # docs/adrs/0006-troca-de-provedor-llm-para-groq.md, seção "Otimização de
+    # latência". A função `get_schema` continua existindo em
+    # `tools/sql_tools.py`, só não é mais registrada aqui.
     agent = build_agent()
 
-    assert agent.tools == [get_schema, query_sales]
+    assert agent.tools == [query_sales]
 
 
 def test_build_agent_forces_structured_output_via_agent_answer() -> None:
@@ -84,6 +90,28 @@ def test_build_agent_uses_a_tool_less_parser_model_for_structured_output() -> No
     assert agent.parser_model.supports_json_schema_outputs is True
 
 
+def test_build_agent_parser_model_uses_a_smaller_model_than_the_main_one() -> None:
+    # docs/adrs/0006-troca-de-provedor-llm-para-groq.md, seção "Otimização de
+    # latência" (2026-09-22): o parser_model só estrutura em JSON uma resposta que
+    # o modelo principal já produziu — uma tarefa mecânica, não de raciocínio —
+    # então não precisa do mesmo modelo grande (`openai/gpt-oss-120b`, default do
+    # Agno, não sobrescrito no modelo principal) do agente principal.
+    agent = build_agent()
+
+    assert agent.model.id == "openai/gpt-oss-120b"
+    assert agent.parser_model.id == "openai/gpt-oss-20b"
+
+
+def test_build_agent_sets_a_bounded_max_tokens_on_both_models() -> None:
+    # Nenhum dos dois modelos tinha `max_tokens` configurado antes (default do
+    # Agno/Groq é `None` — sem teto algum) — ver docs/adrs/0006-..., mesma seção.
+    agent = build_agent()
+
+    assert agent.model.max_tokens is not None
+    assert agent.parser_model.max_tokens is not None
+    assert agent.parser_model.max_tokens < agent.model.max_tokens
+
+
 @dataclass
 class _InvalidJsonModel(Model):
     """Fake ``Model`` do Agno que sempre devolve conteúdo que não é JSON válido.
@@ -130,7 +158,7 @@ def test_agent_run_with_invalid_json_logs_warning_and_returns_raw_string(
     invalid_json = "isto não é um JSON válido {"
     agent = Agent(
         model=_InvalidJsonModel(content=invalid_json),
-        tools=[get_schema, query_sales],
+        tools=[query_sales],
         output_schema=AgentAnswer,
         instructions=SYSTEM_PROMPT,
     )
@@ -225,7 +253,7 @@ def test_agent_run_with_tool_use_failed_error_logs_and_returns_raw_error_content
     model = _ToolUseFailedModel()
     agent = Agent(
         model=model,
-        tools=[get_schema, query_sales],
+        tools=[query_sales],
         output_schema=AgentAnswer,
         instructions=SYSTEM_PROMPT,
     )
@@ -245,9 +273,9 @@ class _ToolFailureModel(Model):
     """Fake ``Model`` cuja 1ª resposta pede uma tool REAL que vai falhar de verdade.
 
     Ao contrário de ``tests/test_api.py`` (onde ``_FakeAgent`` substitui o
-    ``Agent`` inteiro), aqui só o ``Model`` é falso — o ``Agent`` e as tools
-    (``get_schema``/``query_sales`` de ``data_agent.tools.sql_tools``) são os
-    reais. Isso permite disparar, de propósito e deterministicamente, uma
+    ``Agent`` inteiro), aqui só o ``Model`` é falso — o ``Agent`` e a tool
+    (``query_sales`` de ``data_agent.tools.sql_tools``) são reais. Isso permite
+    disparar, de propósito e deterministicamente, uma
     exceção de verdade dentro de uma tool real (aqui, um ``FileNotFoundError``
     de ``data_agent/db.py`` ao apontar ``query_sales`` para um ``db_path``
     inexistente) sem depender de uma chamada de rede real a um LLM.
@@ -323,7 +351,7 @@ def test_agent_run_when_a_real_tool_raises_does_not_propagate_the_exception() ->
     """
     agent = Agent(
         model=_ToolFailureModel(),
-        tools=[get_schema, query_sales],
+        tools=[query_sales],
         output_schema=AgentAnswer,
         instructions=SYSTEM_PROMPT,
     )

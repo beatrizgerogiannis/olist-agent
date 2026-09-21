@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -232,9 +233,23 @@ def ask(request: Request, payload: AskRequest, response: Response) -> AgentAnswe
     estruturada" abaixo), a resposta carrega o header ``X-Total-Tokens`` com o
     custo em tokens da chamada (ver ``_total_tokens``) — não existe nos casos em
     que ``agent.run()`` levanta antes de devolver nada.
+
+    Todo log estruturado emitido a partir daqui carrega ``duration_seconds``
+    (``time.perf_counter()`` desde antes de ``agent.run()``, incluindo o retry de
+    ``tool_use_failed`` se acontecer) — usado para medir o impacto real de mudanças
+    de latência (ver docs/adrs/0006-troca-de-provedor-llm-para-groq.md, seção
+    "Otimização de latência") sem depender só do Langfuse.
     """
     logger.info("agent_call_started", question=payload.question)
     agent = get_agent()
+    # `time.perf_counter()` (não `time.time()`, que pode voltar por ajuste de
+    # relógio do sistema) mede a latência fim-a-fim de `agent.run()` — incluindo o
+    # retry do `tool_use_failed` abaixo, se acontecer — para medir o impacto real
+    # das otimizações de latência (remoção de `get_schema` como tool, `parser_model`
+    # menor, `max_tokens` — ver docs/adrs/0006-troca-de-provedor-llm-para-groq.md,
+    # seção "Otimização de latência") comparando `duration_seconds` nos logs
+    # estruturados antes/depois, sem precisar consultar o Langfuse manualmente.
+    start_time = time.perf_counter()
     try:
         run_output = agent.run(payload.question)
         if _is_tool_use_failed_payload(run_output.content):
@@ -246,6 +261,7 @@ def ask(request: Request, payload: AskRequest, response: Response) -> AgentAnswe
                 "agent_call_tool_use_failed_retry",
                 question=payload.question,
                 content=run_output.content,
+                duration_seconds=round(time.perf_counter() - start_time, 3),
             )
             run_output = agent.run(payload.question)
     except ModelProviderError as exc:
@@ -255,6 +271,7 @@ def ask(request: Request, payload: AskRequest, response: Response) -> AgentAnswe
             question=payload.question,
             error=str(exc),
             timeout=is_timeout,
+            duration_seconds=round(time.perf_counter() - start_time, 3),
         )
         if is_timeout:
             raise HTTPException(
@@ -262,12 +279,18 @@ def ask(request: Request, payload: AskRequest, response: Response) -> AgentAnswe
             ) from exc
         raise HTTPException(status_code=502, detail=_PROVIDER_ERROR_DETAIL) from exc
     except Exception as exc:
-        logger.error("agent_call_failed", question=payload.question, error=str(exc))
+        logger.error(
+            "agent_call_failed",
+            question=payload.question,
+            error=str(exc),
+            duration_seconds=round(time.perf_counter() - start_time, 3),
+        )
         raise HTTPException(
             status_code=502,
             detail="Falha inesperada ao executar o agente ou uma de suas tools.",
         ) from exc
 
+    duration_seconds = round(time.perf_counter() - start_time, 3)
     total_tokens = _total_tokens(run_output)
     error_headers = {_HEADER_TOTAL_TOKENS: str(total_tokens)} if total_tokens is not None else {}
 
@@ -284,6 +307,7 @@ def ask(request: Request, payload: AskRequest, response: Response) -> AgentAnswe
                 question=payload.question,
                 content=run_output.content,
                 total_tokens=total_tokens,
+                duration_seconds=duration_seconds,
             )
             if total_tokens is not None:
                 response.headers[_HEADER_TOTAL_TOKENS] = str(total_tokens)
@@ -304,6 +328,7 @@ def ask(request: Request, payload: AskRequest, response: Response) -> AgentAnswe
                 question=payload.question,
                 content=run_output.content,
                 total_tokens=total_tokens,
+                duration_seconds=duration_seconds,
             )
             raise HTTPException(
                 status_code=502, detail=_PROVIDER_ERROR_DETAIL, headers=error_headers
@@ -313,6 +338,7 @@ def ask(request: Request, payload: AskRequest, response: Response) -> AgentAnswe
             question=payload.question,
             content=run_output.content,
             total_tokens=total_tokens,
+            duration_seconds=duration_seconds,
         )
         raise HTTPException(
             status_code=502,
@@ -325,6 +351,7 @@ def ask(request: Request, payload: AskRequest, response: Response) -> AgentAnswe
         question=payload.question,
         status=run_output.content.status,
         total_tokens=total_tokens,
+        duration_seconds=duration_seconds,
     )
     if total_tokens is not None:
         response.headers[_HEADER_TOTAL_TOKENS] = str(total_tokens)

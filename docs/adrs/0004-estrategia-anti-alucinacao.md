@@ -94,9 +94,41 @@ outros dois podem falhar:
   semanticamente errado (ex. um `JOIN` errado que ainda devolve linhas) e reportar
   `status="answered"` com um número tecnicamente "vindo de uma tool", porém incorreto
   — isso já era uma limitação conhecida de ADR-0003 e esta estratégia não a resolve.
-  Isso só será efetivamente checado quando a malha de avaliação automatizada (Dia 6)
-  existir; até lá, `tests/golden_questions.jsonl` é só um gabarito manual, não uma
-  checagem executável contra o agente.
+
+  **Achado real, não mais hipotético** (teste de sanidade manual contra a demo
+  pública, 2026-09-21): a pergunta "Quantas vendas houve no estado do 'Distrito
+  Federal Sul'?" — um nome plausível, mas que não é nenhuma das 27 UFs reais — gerou
+  `WHERE customer_state = 'Distrito Federal Sul'`, sintaticamente válido e permitido
+  pelos guard-rails (é só uma leitura das tabelas permitidas), devolveu 0 linhas, e o
+  agente respondeu `status="answered"`, `confidence=1.0`, "0 vendas no estado
+  'Distrito Federal Sul'" — reproduzindo exatamente a lacuna descrita acima.
+  Diferente da armadilha `q08` do dataset original ('XX', um código óbvio demais para
+  ser confundido com uma UF), o nome usado aqui é plausível o suficiente para que o
+  modelo não o reconheça como inválido só pelo próprio conhecimento geral — precisa
+  checar contra os dados reais.
+
+  **Mitigação aplicada**: reforço da regra 3 de `SYSTEM_PROMPT`
+  (`src/data_agent/prompts.py`), não uma validação estrutural fixa por coluna (ex.
+  uma lista hardcoded de UFs) — instrui que, para filtros categóricos (estado,
+  cidade, `seller_id`, categoria de produto, etc.), um resultado de zero linhas só
+  pode ser aceito como resposta válida depois de confirmar (via `SELECT DISTINCT
+  <coluna> WHERE <coluna> = '<valor>'`) que o valor filtrado existe de fato na
+  coluna; se não existir, a resposta é `insufficient_data` explicando que a entidade
+  não foi encontrada, nunca "0 vendas". Optou-se por reforçar o prompt (mesma
+  categoria de mecanismo do resto desta ADR) em vez de validação estrutural fixa
+  porque o domínio de valores válidos não é fechado/estático para todas as colunas
+  citadas — `seller_id` e categoria de produto têm milhares de valores, diferente
+  das 27 UFs; uma tabela fixa cobriria só `estado`, exigindo uma exceção especial por
+  coluna, o que contraria a filosofia de SQL controlado e genérico de ADR-0003
+  (nenhuma lógica hardcoded por dimensão). Como qualquer reforço de prompt, isso
+  **não é uma garantia estrutural** — o LLM ainda pode, ocasionalmente, pular a
+  confirmação antes de responder; só a malha de avaliação automatizada
+  (`scripts/run_eval.py`, hoje existente desde o Dia 6, diferente de quando este
+  trade-off foi escrito originalmente) contra `tests/golden_questions.jsonl`
+  (`q27`/`q28`, adicionadas para cobrir esta classe de armadilha — entidade
+  categórica inexistente, mas com nome plausível) detecta uma regressão futura;
+  `tests/test_prompts.py` fixa por teste que a instrução continua presente no texto
+  do prompt.
 - A distinção entre `insufficient_data` (dado não coberto/zero linhas/erro de tool) e
   `out_of_scope` (tipo de pergunta que o agente não responde por definição) depende
   de o LLM aplicar corretamente a regra do prompt — é um julgamento semântico, não uma

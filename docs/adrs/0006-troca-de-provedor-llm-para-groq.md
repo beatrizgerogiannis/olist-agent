@@ -72,6 +72,70 @@ essa escolha (feita aqui, com a checagem de `supported_features` acima) em dois 
 de modelo continua possível, mas é uma mudança de código em `data_agent/agent.py`, não de
 `.env`.
 
+### Otimização de latência (2026-09-22)
+
+Medição informal contra a demo pública apontava ~30s por pergunta. Duas mudanças em
+`data_agent/agent.py`, sem tocar guard-rails, schemas Pydantic ou o escopo de tabelas
+permitidas:
+
+1. **`get_schema` deixou de ser uma tool do modelo principal.** Antes, `tools=[get_schema,
+   query_sales]` fazia o modelo decidir, em runtime, chamar `get_schema` como um turno
+   completo (ida-e-volta à API da Groq) antes de sequer montar a primeira `query_sales` —
+   visível nos traces do Langfuse como uma chamada de ~15-20s isolada, sempre a primeira do
+   loop de tools, para um schema que **nunca muda** (as 8 tabelas são fixas, carregadas uma
+   vez por `scripts/load_data.py`). Como o schema é estático, ele foi embutido como texto
+   direto em `prompts.SYSTEM_PROMPT` (tabelas, colunas, tipos e relações, extraído de
+   `docs/data_dictionary.md` para não divergir da mesma fonte de verdade) — o modelo já
+   chega com o schema disponível, sem precisar de uma tool para descobri-lo. `tools=[]` do
+   agente principal agora é só `[query_sales]`. A função `get_schema` (`tools/sql_tools.py`)
+   não foi apagada (segue disponível para depuração manual/uso futuro), só não é mais
+   registrada como tool ativa em `build_agent()`.
+2. **`parser_model` trocou de `openai/gpt-oss-120b` para `openai/gpt-oss-20b`.** A tarefa do
+   `parser_model` é só estruturar em JSON uma resposta de texto que o modelo principal já
+   produziu — não é uma tarefa de raciocínio (montar SQL, decidir `status`, interpretar o
+   schema), então não precisa do maior modelo do catálogo. Reconsultado `GET
+   /openai/v1/models` em 2026-09-22 (mesmo processo do Dia 5, ver acima) para confirmar o
+   catálogo gratuito **atual** antes de escolher — ele mudou desde 2026-09-15: hoje só 13
+   modelos estão disponíveis, e `llama-3.1-8b-instant` (sugerido inicialmente como candidato
+   óbvio) **não está mais no catálogo** desta chave. Os únicos 3 modelos com
+   `structured_outputs` continuam sendo os mesmos de ADR-0006 original —
+   `openai/gpt-oss-20b`, `openai/gpt-oss-120b`, `openai/gpt-oss-safeguard-20b` (este último
+   descartado de novo, é um modelo de moderação/safety) — então `openai/gpt-oss-20b` (a
+   versão 20B, menor, da mesma família já validada para `structured_outputs`) é a única
+   opção real de "modelo menor" disponível hoje para essa tarefa, não uma escolha entre
+   várias famílias de modelo.
+3. **`max_tokens` explícito nos dois modelos** (antes `None` nos dois — sem teto algum).
+   Medido via traces reais do Langfuse (usage por `GENERATION`): turnos do modelo principal
+   (que inclui tokens de raciocínio, já que os modelos `gpt-oss` têm a feature `reasoning`)
+   ficaram entre 68 e 406 tokens de saída; a chamada do `parser_model` ficou em 214. Setado
+   `max_tokens=2048` no modelo principal e `max_tokens=1024` no `parser_model` (~5x o pico
+   observado em cada um) — teto generoso o bastante para não truncar nenhuma resposta normal,
+   mas presente para não deixar uma geração presa/anormalmente longa (ex. um loop de
+   raciocínio do modelo) inflar a latência de uma chamada sem limite nenhum.
+
+**Impacto medido** (subconjunto de 4 perguntas do golden dataset — `q01`, `q11`, `q17`,
+`q22` — contra a API local rodando as três mudanças acima, Groq real, medido via o novo
+`duration_seconds` de `data_agent/api.py::ask`, 2026-09-22): `q01` (contagem simples,
+`answered`) caiu para **4,4s** — a melhora mais limpa e diretamente atribuível à remoção de
+`get_schema`, já que essa era justamente uma pergunta de um único filtro, sem precisar de
+uma segunda tool call antes; nos traces anteriores (pré-mudança), só o turno de `get_schema`
+já consumia ~15-20s sozinho, antes de sequer chegar em `query_sales`. `q11` ficou em 20,4s.
+`q17` e `q22`, porém, não mostram a mesma melhora limpa — 60,5s e 85,0s respectivamente — e
+por motivos que **não são regressão das três mudanças**: `q17` disparou a nova regra 3
+(verificação de existência de entidade) mesmo para um estado real (`SC`), rodando uma
+`query_sales` extra (`SELECT DISTINCT seller_state ...`) antes do `COUNT`, e as duas últimas
+perguntas da bateria caíram numa janela de maior contenção de rate limit da Groq (mesmo
+padrão de "30-90s sob carga" já documentado acima); `q22` especificamente bateu de novo no
+bug `tool_use_failed` (ver `_is_tool_use_failed_payload` em `data_agent/api.py`, mitigado
+numa sessão anterior) — o retry automático rodou o loop de tools inteiro pela segunda vez do
+zero, dobrando a latência dessa pergunta especificamente. Ou seja: o ganho de remover
+`get_schema` é real e mensurável em uma chamada "limpa" (`q01`), mas fica mascarado nas
+outras três por dois fatores conhecidos e não relacionados às mudanças desta seção
+(contenção de rate limit da Groq sob rajada de chamadas do próprio teste, e a regra 3 —
+adicionada numa sessão anterior — custando uma tool call extra quando decide verificar uma
+entidade). 4/4 perguntas corretas (nenhuma alucinação, nenhuma recusa indevida); 29.254
+tokens consumidos nesta medição.
+
 `data_agent/api.py` também precisou mudar: o `except ModelProviderError` que distingue timeout
 (`504`) de outro erro de provedor (`502`) — ver
 [ADR-0005](0005-insufficient-data-como-resposta-valida.md) — inspecionava
@@ -101,6 +165,9 @@ substituiu `openai.APITimeoutError` nessa checagem.
   e mais tokens consumidos por pergunta do que uma chamada única com `response_format` nativo
   (o que a OpenAI permite). Isso é visível nos traces do Langfuse (ver
   [ADR-0007](0007-observabilidade-com-langfuse.md)) como um span extra de modelo por `agent.run`.
+  Parcialmente mitigado em 2026-09-22 (ver seção "Otimização de latência" acima): essa chamada
+  extra agora usa `openai/gpt-oss-20b` em vez de `openai/gpt-oss-120b`, então continua sendo uma
+  chamada a mais, mas mais rápida/barata do que era.
 - **Menos madura que a API da OpenAI para este tipo de combinação.** A restrição
   `response_format` + `tools` é uma limitação real e atual da API da Groq (não do Agno), então se
   a Groq relaxar essa restrição no futuro, `parser_model` deixa de ser necessário, mas nada neste

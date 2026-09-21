@@ -79,19 +79,19 @@ FastAPI (src/data_agent/api.py)
         valida AskRequest (Pydantic) → 422 se malformado
         ▼
 Agent do Agno (src/data_agent/agent.py, build_agent())
-  │  SYSTEM_PROMPT (src/data_agent/prompts.py) + tools [get_schema, query_sales]
+  │  SYSTEM_PROMPT (src/data_agent/prompts.py, já inclui o schema das 8 tabelas
+  │  como texto) + tools [query_sales]
   │
-  ├─▶ tool: get_schema()          ─┐
-  ├─▶ tool: query_sales(sql)       ├─▶ tools/guardrails.py (só SELECT, só as 8
-  │     (0..N chamadas, decididas  │    tabelas do Olist, LIMIT, timeout)
-  │      pelo próprio modelo)     ─┘        │
+  ├─▶ tool: query_sales(sql)       ──▶ tools/guardrails.py (só SELECT, só as 8
+  │     (0..N chamadas, decididas       tabelas do Olist, LIMIT, timeout)
+  │      pelo próprio modelo)                │
   │                                          ▼
   │                                  DuckDB read-only (data/warehouse.duckdb,
   │                                  via src/data_agent/db.py)
   │
   │  loop de tools termina; resposta em texto ainda não estruturada
   ▼
-parser_model (2º Groq, sem tools, supports_json_schema_outputs=True)
+parser_model (2º Groq, menor — openai/gpt-oss-20b —, sem tools, supports_json_schema_outputs=True)
   │  estrutura a resposta final como AgentAnswer (Pydantic)
   ▼
 response_model=AgentAnswer validado pelo FastAPI
@@ -126,13 +126,21 @@ AgnoInstrumentor → OTLP → Langfuse (src/data_agent/observability.py).
    `question` ausente, vazia ou de tipo errado já volta `422` sem chegar ao agente.
 4. **`api.py` → `Agent` do Agno**: `get_agent()` (cacheado por `@lru_cache`) devolve a
    instância única do processo, construída por `build_agent()`. O modelo principal recebe
-   `SYSTEM_PROMPT` como instruções e as tools `get_schema`/`query_sales` como única fonte de
-   dados — ver [ADR-0001](adrs/0001-escolha-do-agno.md) (por que Agno) e
+   `SYSTEM_PROMPT` como instruções — que já inclui o schema das 8 tabelas como texto (nomes,
+   tipos, relações, extraído de `docs/data_dictionary.md`), já que é estático e não muda em
+   runtime — e a tool `query_sales` como única fonte de dados — ver
+   [ADR-0001](adrs/0001-escolha-do-agno.md) (por que Agno) e
    [ADR-0004](adrs/0004-estrategia-anti-alucinacao.md) (por que esse grounding é
-   não-negociável).
-5. **Loop de tool-calling**: o modelo decide, sozinho, quantas vezes chamar `get_schema`
-   (confirmar nomes de tabela/coluna) e `query_sales(sql)` (rodar a consulta). Cada `sql`
-   passa por `tools/guardrails.py` antes de tocar o DuckDB: só uma instrução `SELECT`
+   não-negociável). Até 2026-09-21, o schema era descoberto via uma tool `get_schema`
+   separada, chamada em runtime; removida em 2026-09-22 (otimização de latência) porque
+   custava um turno inteiro de ida-e-volta à Groq para redescobrir, a cada pergunta, algo que
+   nunca muda — ver [ADR-0006](adrs/0006-troca-de-provedor-llm-para-groq.md), seção
+   "Otimização de latência". A função `get_schema` (`tools/sql_tools.py`) continua existindo
+   para depuração manual, só não é mais uma tool ativa do agente principal.
+5. **Loop de tool-calling**: o modelo decide, sozinho, quantas vezes chamar
+   `query_sales(sql)` (rodar a consulta) — o schema já veio no prompt, não precisa mais de
+   uma tool à parte para descobri-lo. Cada `sql` passa por `tools/guardrails.py` antes de
+   tocar o DuckDB: só uma instrução `SELECT`
    (incluindo `WITH`/`UNION`), restrita às 8 tabelas do Olist (validado pelo plano lógico
    real do DuckDB, não por regex), com `LIMIT` e timeout garantidos — ver
    [ADR-0002](adrs/0002-camada-de-dados.md) e [ADR-0003](adrs/0003-sql-controlado-vs-tools-granulares.md).
