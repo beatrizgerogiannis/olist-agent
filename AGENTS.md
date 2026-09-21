@@ -44,6 +44,7 @@ data/
   warehouse.duckdb             # banco DuckDB gerado por scripts/load_data.py (não versionado)
 scripts/
   load_data.py                 # carga dos CSVs brutos no DuckDB
+  run_eval.py                  # roda tests/golden_questions.jsonl contra a API e gera docs/eval_report.md
 src/data_agent/
   config.py                    # Settings (pydantic-settings) lendo variáveis de ambiente
   db.py                        # conexão e helpers de acesso ao DuckDB

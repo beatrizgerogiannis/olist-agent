@@ -19,7 +19,6 @@ dependencies = [
     "opentelemetry-exporter-otlp",
     "structlog",
     "sqlglot>=30.18.0",
-    "openai>=3.13.0",
 ]
 
 [dependency-groups]
@@ -30,6 +29,7 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
+    "httpx",
 ]
 
 [build-system]

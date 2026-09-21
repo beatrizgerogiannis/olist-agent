@@ -1,0 +1,23 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # DUCKDB_PATH aponta para dentro do container, onde o volume abaixo é
+      # montado — sobrescreve o valor de .env (que é relativo ao host).
+      DUCKDB_PATH: /app/data/warehouse.duckdb
+    volumes:
+      # Persiste data/warehouse.duckdb (gerado localmente por
+      # `uv run python scripts/load_data.py`, ver AGENTS.md) entre reinícios
+      # do container — a imagem não embute o warehouse.
+      - ./data/warehouse.duckdb:/app/data/warehouse.duckdb
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped

@@ -34,7 +34,14 @@ fora de set/2016–out/2018, um vendedor/estado/categoria que não existe na bas
 combinação de filtros sem nenhuma linha correspondente (ver limitações listadas em \
 docs/data_dictionary.md) — retorne `status="insufficient_data"` com uma explicação \
 honesta em `answer` (ex.: "não há pedidos registrados no período solicitado; os dados \
-cobrem set/2016 a out/2018") em vez de responder com um valor.
+cobrem set/2016 a out/2018") em vez de responder com um valor. **Atenção**: uma query de \
+agregação (`COUNT(*)`, `SUM(...)`, `AVG(...)` sem `GROUP BY`) sempre devolve exatamente 1 \
+linha, mesmo quando nenhum registro satisfaz o filtro — `row_count == 1` não significa "há \
+dado"; nesse caso o valor agregado em si é `0` (`COUNT`) ou `NULL` (`SUM`/`AVG`/`MIN`/`MAX`). \
+Um `COUNT(*) = 0` para um período fora de set/2016–out/2018 (ex.: novembro de 2018, logo \
+após o fim real dos dados) não é uma resposta válida de "zero pedidos" — é o mesmo sinal de \
+dado insuficiente que `row_count == 0`, e a pergunta continua sendo sobre um período que a \
+base não cobre.
 
 4. **Pergunta fora do escopo funcional → `status="out_of_scope"`.** Se a pergunta \
 pedir algo que as 8 tabelas do Olist não têm como responder por definição — não é \
@@ -60,7 +67,10 @@ docs/data_dictionary.md): `customer_id` é por pedido, não por pessoa — use \
 sobre pedidos com `order_status = 'delivered'` e `order_delivered_customer_date` \
 preenchida; `geolocation` é uma amostra aproximada por prefixo de CEP, sem chave \
 única, não um geocodificador; `review_id` sozinho não é único, a chave é \
-(`review_id`, `order_id`).
+(`review_id`, `order_id`); para calcular diferença entre datas em dias no DuckDB, use \
+`date_diff('day', data_inicial, data_final)` — subtrair dois `TIMESTAMP` diretamente \
+(`data_final - data_inicial`) devolve um `INTERVAL`, não um número de dias, e `julianday` \
+não existe no DuckDB (é função do SQLite).
 
 7. **Ao errar, erre para o lado da recusa.** Na dúvida entre responder com um número \
 que pode estar errado e recusar com `insufficient_data`/`out_of_scope`, sempre \

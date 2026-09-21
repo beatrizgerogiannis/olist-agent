@@ -6,6 +6,7 @@ erro).
 
 from __future__ import annotations
 
+import json
 import logging
 from functools import lru_cache
 from typing import Literal
@@ -14,7 +15,8 @@ import groq
 import structlog
 from agno.agent import Agent
 from agno.exceptions import ModelProviderError
-from fastapi import FastAPI, HTTPException
+from agno.run.agent import RunOutput
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 
 from data_agent.agent import build_agent
@@ -80,8 +82,63 @@ def health() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
+# Mesmo texto usado no branch de ``ModelProviderError`` sem timeout logo abaixo —
+# ambos representam a mesma categoria de falha (infraestrutura/provedor), só
+# chegando por caminhos diferentes (exceção vs. conteúdo cru, ver
+# ``_is_provider_error_payload``). Um consumidor da API (ex.
+# ``scripts/run_eval.py``) que precise diferenciar infraestrutura de falha de
+# raciocínio do agente depende desse texto ser idêntico nos dois casos.
+_PROVIDER_ERROR_DETAIL = "Falha ao consultar o modelo de linguagem."
+
+# Header (não campo de `AgentAnswer`) para expor o custo em tokens de uma chamada,
+# sem alterar o contrato documentado em ADR-0005 — o schema de saída do agente é
+# decidido pelo `parser_model` (ver ADR-0006) e não faz sentido pedir a ele para
+# "saber" quantos tokens ele mesmo consumiu. Adicionado no Dia 6 para dar
+# visibilidade de consumo a `scripts/run_eval.py` (o tier gratuito da Groq tem
+# orçamento diário apertado — ver docs/adrs/0009-golden-dataset-e-metricas-de-avaliacao.md).
+_HEADER_TOTAL_TOKENS = "X-Total-Tokens"
+
+
+def _total_tokens(run_output: RunOutput) -> int | None:
+    """Extrai o total de tokens (todas as chamadas de modelo desta execução,
+    incluindo o ``parser_model``) de ``run_output.metrics``, se disponível.
+
+    ``metrics`` é ``None`` só se o Agno não chegou a inicializar `RunMetrics`
+    (não observado em uso normal, mas o tipo é `Optional` — ver
+    ``agno.run.agent.RunOutput``), daí o acesso defensivo.
+    """
+    metrics = run_output.metrics
+    return metrics.total_tokens if metrics is not None else None
+
+
+def _is_provider_error_payload(content: object) -> bool:
+    """``True`` se ``content`` é o corpo de erro cru de um provedor de LLM (ex.
+    Groq), não uma tentativa (só malformada) de ``AgentAnswer``.
+
+    Descoberto rodando ``scripts/run_eval.py`` contra a Groq real sob rate limit
+    (Dia 6): o ``parser_model`` (ver docs/adrs/0006-troca-de-provedor-llm-para-groq.md)
+    pode falhar com um erro do próprio provedor (ex. ``429`` de rate limit) sem que
+    o Agno levante nenhuma exceção — o mesmo comportamento de "loga um warning e
+    deixa a string crua passar" que docs/adrs/0004-estrategia-anti-alucinacao.md já
+    documentava para JSON malformado também se aplica aqui, só que a "string crua"
+    é o corpo de erro do provedor (``{"error": {"message": ..., "code": ...}}``),
+    não uma tentativa de resposta do modelo. Sem esta checagem, isso caía no branch
+    genérico de "saída não estruturada" — uma categoria de falha de *qualidade do
+    modelo*, quando na real é a mesma falha de *infraestrutura* que o branch de
+    ``ModelProviderError`` acima já trata como ``502``/``504`` quando é levantada
+    como exceção em vez de aparecer como conteúdo.
+    """
+    if not isinstance(content, str):
+        return False
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, dict) and isinstance(parsed.get("error"), dict)
+
+
 @app.post("/ask", response_model=AgentAnswer)
-def ask(request: AskRequest) -> AgentAnswer:
+def ask(request: AskRequest, response: Response) -> AgentAnswer:
     """Responde ``request.question`` via o agente e suas tools de SQL controlado.
 
     ``request`` já chega validado como ``AskRequest`` (FastAPI devolve 422
@@ -89,8 +146,14 @@ def ask(request: AskRequest) -> AgentAnswer:
     resposta é validada como ``AgentAnswer`` na saída. ``status="insufficient_data"``
     e ``status="out_of_scope"`` são decisões válidas do agente e voltam com 200,
     como qualquer outra ``AgentAnswer`` — só uma falha real de infraestrutura
-    (timeout do modelo, erro do provedor, uma tool/exceção que escapou do
-    agente) vira um erro HTTP.
+    (timeout do modelo, erro do provedor — levantado como exceção ou, no caso do
+    ``parser_model``, entregue como conteúdo cru, ver ``_is_provider_error_payload``
+    — ou uma tool/exceção que escapou do agente) vira um erro HTTP.
+
+    Quando ``run_output`` chega a existir (sucesso ou os dois ramos de "saída não
+    estruturada" abaixo), a resposta carrega o header ``X-Total-Tokens`` com o
+    custo em tokens da chamada (ver ``_total_tokens``) — não existe nos casos em
+    que ``agent.run()`` levanta antes de devolver nada.
     """
     logger.info("agent_call_started", question=request.question)
     agent = get_agent()
@@ -108,9 +171,7 @@ def ask(request: AskRequest) -> AgentAnswer:
             raise HTTPException(
                 status_code=504, detail="Timeout ao consultar o modelo de linguagem."
             ) from exc
-        raise HTTPException(
-            status_code=502, detail="Falha ao consultar o modelo de linguagem."
-        ) from exc
+        raise HTTPException(status_code=502, detail=_PROVIDER_ERROR_DETAIL) from exc
     except Exception as exc:
         logger.error("agent_call_failed", question=request.question, error=str(exc))
         raise HTTPException(
@@ -118,20 +179,38 @@ def ask(request: AskRequest) -> AgentAnswer:
             detail="Falha inesperada ao executar o agente ou uma de suas tools.",
         ) from exc
 
+    total_tokens = _total_tokens(run_output)
+    error_headers = {_HEADER_TOTAL_TOKENS: str(total_tokens)} if total_tokens is not None else {}
+
     if not isinstance(run_output.content, AgentAnswer):
+        if _is_provider_error_payload(run_output.content):
+            logger.error(
+                "agent_call_provider_error_as_content",
+                question=request.question,
+                content=run_output.content,
+                total_tokens=total_tokens,
+            )
+            raise HTTPException(
+                status_code=502, detail=_PROVIDER_ERROR_DETAIL, headers=error_headers
+            )
         logger.error(
             "agent_call_invalid_output",
             question=request.question,
             content=run_output.content,
+            total_tokens=total_tokens,
         )
         raise HTTPException(
             status_code=502,
             detail="O modelo não retornou uma resposta estruturada válida.",
+            headers=error_headers,
         )
 
     logger.info(
         "agent_call_completed",
         question=request.question,
         status=run_output.content.status,
+        total_tokens=total_tokens,
     )
+    if total_tokens is not None:
+        response.headers[_HEADER_TOTAL_TOKENS] = str(total_tokens)
     return run_output.content
